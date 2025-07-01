@@ -1,0 +1,8 @@
+selenium
+gspread
+pandas
+google-auth
+google-auth-oauthlib
+colorama
+keyboard
+chromedriver-autoinstaller

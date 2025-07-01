@@ -1,0 +1,30 @@
+name: Daily Google Drive Backup
+
+on:
+  schedule:
+    # Runs every day at 00:00 UTC (02:00 CEST)
+    - cron: '0 0 * * *'
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      - name: Run Drive backup
+        env:
+          SOURCE_FOLDER_ID: '1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi'
+          DEST_FOLDER_ID:   '10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v'
+        run: |
+          python backup_drive.py
