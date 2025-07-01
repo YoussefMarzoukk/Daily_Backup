@@ -104,6 +104,7 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
+from collections import deque
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -122,30 +123,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def find_folder(drive, parent_id: str, name: str) -> str | None:
-    """Return a child‑folder ID named *name* under *parent_id*, else None."""
-    q = (
-        f"'{parent_id}' in parents "
-        "and mimeType='application/vnd.google-apps.folder' "
-        f"and name='{name}' and trashed=false"
-    )
-
-    res = (
-        drive.files()
-        .list(
-            q=q,
-            fields="files(id)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
-    )
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
-
-
 def delete_folder_recursive(drive, folder_id: str) -> None:
-    """Hard‑delete *folder_id* and every item it contains."""
+    """Delete a folder and everything in it."""
     children = (
         drive.files()
         .list(
@@ -155,46 +134,71 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
             includeItemsFromAllDrives=True,
             pageSize=1000,
         )
-        .execute()
-        .get("files", [])
+        .execute()["files"]
     )
-    for child in children:
-        if child["mimeType"] == "application/vnd.google-apps.folder":
-            delete_folder_recursive(drive, child["id"])
+    for ch in children:
+        if ch["mimeType"] == "application/vnd.google-apps.folder":
+            delete_folder_recursive(drive, ch["id"])
         else:
-            drive.files().delete(fileId=child["id"]).execute()
+            drive.files().delete(fileId=ch["id"]).execute()
     drive.files().delete(fileId=folder_id).execute()
-    log.info("Deleted folder %s", folder_id)
 
 
-def list_all_spreadsheets(drive, folder_id: str) -> list[dict]:
-    """Return *every* spreadsheet file in *folder_id*, following pagination."""
-    q = (
-        f"'{folder_id}' in parents "
-        "and mimeType='application/vnd.google-apps.spreadsheet' "
-        "and trashed=false"
+def list_every_sheet(drive, root_folder: str) -> list[dict]:
+    """
+    Return every Google Sheet file reachable under *root_folder*
+    (descends into sub‑folders, de‑duplicates, resolves shortcuts).
+    """
+    sheets: dict[str, dict] = {}      # id → file‑dict
+    visited_folders: set[str] = set()
+    q_flags = dict(
+        supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000
     )
 
-    files: list[dict] = []
-    page_token = None
-    while True:
-        resp = (
-            drive.files()
-            .list(
-                q=q,
-                fields="nextPageToken, files(id,name)",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-                pageSize=1000,
-                pageToken=page_token,
+    queue = deque([root_folder])
+    while queue:
+        fid = queue.popleft()
+        if fid in visited_folders:
+            continue
+        visited_folders.add(fid)
+
+        page_token = None
+        while True:
+            resp = (
+                drive.files()
+                .list(
+                    q=f"'{fid}' in parents and trashed=false",
+                    fields=(
+                        "nextPageToken, "
+                        "files(id,name,mimeType,shortcutDetails/targetId,"
+                        "shortcutDetails/targetMimeType)"
+                    ),
+                    pageToken=page_token,
+                    **q_flags,
+                )
+                .execute()
             )
-            .execute()
-        )
-        files.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return files
+            for f in resp.get("files", []):
+                mt = f["mimeType"]
+                if mt == "application/vnd.google-apps.folder":
+                    queue.append(f["id"])
+                elif mt == "application/vnd.google-apps.spreadsheet":
+                    sheets[f["id"]] = f
+                elif mt == "application/vnd.google-apps.shortcut":
+                    if (
+                        f["shortcutDetails"]["targetMimeType"]
+                        == "application/vnd.google-apps.spreadsheet"
+                    ):
+                        target_id = f["shortcutDetails"]["targetId"]
+                        sheets[target_id] = {
+                            "id": target_id,
+                            "name": f["name"] + " (shortcut)",
+                        }
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    return list(sheets.values())
 
 
 def main() -> None:
@@ -204,18 +208,28 @@ def main() -> None:
         )
         drive = build("drive", "v3", credentials=creds)
 
-        src_folder = os.environ["SOURCE_FOLDER_ID"]
+        src_root = os.environ["SOURCE_FOLDER_ID"]
         dst_parent = os.environ["DEST_FOLDER_ID"]
         today = datetime.utcnow().strftime("%d.%m.%Y")
 
-        # 1) wipe old backup (if any)
-        existing = find_folder(drive, dst_parent, today)
-        if existing:
-            log.info("Existing backup for %s found (id=%s); deleting…", today, existing)
-            delete_folder_recursive(drive, existing)
+        # ----- purge old backup if present -----
+        res = drive.files().list(
+            q=(
+                f"'{dst_parent}' in parents and "
+                "mimeType='application/vnd.google-apps.folder' "
+                f"and name='{today}' and trashed=false"
+            ),
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        old = res.get("files", [])
+        if old:
+            log.info("Deleting existing backup folder %s …", today)
+            delete_folder_recursive(drive, old[0]["id"])
 
-        # 2) create fresh dated folder
-        backup_folder_id = (
+        # ----- create new dated folder -----
+        backup_id = (
             drive.files()
             .create(
                 body={
@@ -227,19 +241,18 @@ def main() -> None:
             )
             .execute()["id"]
         )
-        log.info("Created backup folder %s (id=%s)", today, backup_folder_id)
+        log.info("Created backup folder %s (id=%s)", today, backup_id)
 
-        # 3) list *all* spreadsheets in source
-        sheets = list_all_spreadsheets(drive, src_folder)
-        log.info("Found %d spreadsheet(s) to copy", len(sheets))
+        # ----- gather every spreadsheet under src_root -----
+        sheets = list_every_sheet(drive, src_root)
+        log.info("Total spreadsheets found: %d", len(sheets))
 
-        # 4) copy each sheet
-        for sheet in sheets:
+        # ----- copy them -----
+        for s in sheets:
             drive.files().copy(
-                fileId=sheet["id"],
-                body={"name": sheet["name"], "parents": [backup_folder_id]},
+                fileId=s["id"], body={"name": s["name"], "parents": [backup_id]}
             ).execute()
-            log.info("Copied %s", sheet["name"])
+            log.info("Copied %s", s["name"])
 
         log.info("Backup completed successfully.")
     except HttpError as e:
@@ -252,4 +265,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
