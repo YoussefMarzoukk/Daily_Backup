@@ -3,71 +3,98 @@
 name: Saturday Drive Backup via rclone
 
 on:
-  workflow_dispatch:         # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: "0 18 * * 6"     # every Saturday at 18:00 UTC (19:00 CET / 20:00 CEST)
+    - cron: "0 18 * * 6"   # Saturdays 18:00 UTC (19:00 CET / 20:00 CEST)
 
 jobs:
   backup:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out code
+      - name: Check out repository
         uses: actions/checkout@v3
-
-      - name: Expose service-account credentials
-        # we assume credentials.json is in web-portal-automator-src/
-        run: |
-          cp web-portal-automator-src/credentials.json ./creds.json
 
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
 
+      - name: Copy credentials.json into place
+        run: |
+          cp web-portal-automator-src/credentials.json ./creds.json
+
       - name: Configure rclone remotes
         run: |
-          # src will point at your source Drive
+          # src = entire Drive (no root_folder_id)
           rclone config create src drive \
             service_account_file creds.json \
-            token '{}' \
             scope drive \
-            root_folder_id 16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb
+            token '{}'
 
-          # dst will point at your backup Drive parent folder
+          # dst = your backup parent folder
           rclone config create dst drive \
             service_account_file creds.json \
-            token '{}' \
             scope drive \
-            root_folder_id 1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw
+            root_folder_id 1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw \
+            token '{}'
 
       - name: Run rclone copy
         env:
-          TRANSFERS: 5     # number of parallel file transfers
-          CHECKERS: 8      # number of parallel directory scans
+          TRANSFERS: 5    # tune down if you still hit rate limits
+          CHECKERS: 8
         run: |
+          set -e
+
+          # compute date folder
           TODAY=$(date -u +%d.%m.%Y)
           DEST="dst:$TODAY"
 
-          # ensure the dated folder exists
+          # make the dated folder once
           rclone mkdir $DEST
 
-          # copy Folder #1 (and everything under it)
-          rclone copy \
-            src: \
-            $DEST/16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb \
-            --drive-chunk-size 64M \
-            --transfers $TRANSFERS \
-            --checkers $CHECKERS \
-            --drive-use-trash=false \
-            --create-empty-src-dirs
+          # List of folder IDs to back up
+          FOLDERS=(
+            16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb
+            17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB
+            1g6FARH-wKNk9o0s74X60cifwcc6YDqoP
+            1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO
+          )
 
-          # copy Folder #2
-          rclone copy \
-            src:17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB \
-            $DEST/17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB \
-            --drive-chunk-size 64M \
-            --transfers $TRANSFERS \
-            --checkers $CHECKERS \
-            --drive-use-trash=false
+          # Copy each folder tree in parallel
+          for F in "${FOLDERS[@]}"; do
+            rclone copy \
+              --drive-chunk-size 64M \
+              --transfers $TRANSFERS \
+              --checkers $CHECKERS \
+              --drive-use-trash=false \
+              --create-empty-src-dirs \
+              "src:$F" \
+              "$DEST/$F" &
+          done
 
-          echo "✅ Weekly rclone backup complete!"
+          # List of single file (Sheet) IDs to back up
+          FILES=(
+            1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M
+            1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4
+            1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4
+            1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s
+            1cE-eC__yz6bz931D3DyFj-ZyzJGIx-Ta
+            1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8
+            1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc
+          )
+
+          # Copy each file in parallel
+          for F in "${FILES[@]}"; do
+            rclone copy \
+              --drive-chunk-size 64M \
+              --transfers $TRANSFERS \
+              --checkers $CHECKERS \
+              --drive-use-trash=false \
+              "src:$F" \
+              "$DEST/" &
+          done
+
+          # wait for all background transfers to finish
+          wait
+
+          echo "✅ All rclone copy jobs completed."
