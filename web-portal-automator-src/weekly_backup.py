@@ -221,7 +221,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
 DEST_ENV_VAR = "WEEKLY_DEST_FOLDER"
-MAX_WORKERS  = int(os.getenv("BACKUP_THREADS", "10"))
+MAX_WORKERS  = int(os.getenv("BACKUP_THREADS", "4"))
 LOG_EVERY_FILE = os.getenv("LOG_EVERY_FILE", "").lower() == "true"
 PAGE_SIZE = 1000
 # ------------------------------------------------------------------
