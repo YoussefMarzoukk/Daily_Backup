@@ -1,82 +1,155 @@
-name: Saturday Drive Backup (rclone + Python)
+name: Saturday Drive Backup (all links)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 18 * * 6"  # Saturdays 18:00 UTC
+    - cron: "0 18 * * 6"        # every Saturday 18:00 UTC
 
 jobs:
   backup:
     runs-on: ubuntu-latest
 
     env:
+      # where the dated backup folder is created
       WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"
-      TRANSFERS: 5
-      CHECKERS: 8
+      TRANSFERS: "10"        # lower if you hit rate limits
+      CHECKERS:  "20"
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v3
+    # ---------------------------------------------------------
+    - name: Check out repository
+      uses: actions/checkout@v3
 
-      - name: Copy credentials.json locally
-        run: cp web-portal-automator-src/credentials.json ./creds.json
+    - name: Stage service‑account creds
+      run: cp web-portal-automator-src/credentials.json ./creds.json
+    # ---------------------------------------------------------
+    # rclone part – full folder trees
+    # ---------------------------------------------------------
+    - name: Install rclone
+      run: curl https://rclone.org/install.sh | sudo bash
 
-      - name: Install rclone
-        run: curl https://rclone.org/install.sh | sudo bash
+    - name: Write rclone config
+      run: |
+        mkdir -p ~/.config/rclone
+        cat > ~/.config/rclone/rclone.conf <<EOF
+        [src]
+        type = drive
+        scope = drive
+        service_account_file = ./creds.json
+        [dst]
+        type = drive
+        scope = drive
+        service_account_file = ./creds.json
+        root_folder_id = ${WEEKLY_DEST_FOLDER}
+        EOF
 
-      - name: Write rclone config
-        run: |
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [src]
-          type = drive
-          scope = drive
-          service_account_file = ./creds.json
+    - name: Copy all folder trees in parallel
+      id: rclone-folders
+      run: |
+        set -e
+        TODAY=$(date -u +%d.%m.%Y)
+        DEST="dst:${TODAY}"
+        rclone mkdir "$DEST"
 
-          [dst]
-          type = drive
-          scope = drive
-          service_account_file = ./creds.json
-          root_folder_id = ${WEEKLY_DEST_FOLDER}
-          EOF
+        FOLDERS=(
+          16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb  # Leads
+          10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v  # daily‑backup folder
+          17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB  # Resume
+          1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi  # Job‑KPIs
+          1g6FARH-wKNk9o0s74X60cifwcc6YDqoP  # ??? (supplied)
+          1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO  # ??? (supplied)
+        )
 
-      - name: Run rclone folder backup
-        run: |
-          set -e
-          TODAY=$(date -u +%d.%m.%Y)
-          DEST="dst:$TODAY"
-          rclone mkdir $DEST
+        for ID in "${FOLDERS[@]}"; do
+          rclone copy \
+            --drive-chunk-size 64M \
+            --transfers $TRANSFERS \
+            --checkers  $CHECKERS \
+            --drive-use-trash=false \
+            --create-empty-src-dirs \
+            "src:$ID" \
+            "$DEST/$ID" &
+        done
+        wait
+        echo "folders_done=1" >> $GITHUB_OUTPUT
+    # ---------------------------------------------------------
+    # Python part – stand‑alone Sheets
+    # ---------------------------------------------------------
+    - name: Set up Python
+      if: steps.rclone-folders.outputs.folders_done == '1'
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
 
-          # backup 4 large folders in parallel
-          FOLDERS=(
-            16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb
-            17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB
-            1g6FARH-wKNk9o0s74X60cifwcc6YDqoP
-            1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO
-          )
-          for F in "${FOLDERS[@]}"; do
-            rclone copy \
-              --drive-chunk-size 64M \
-              --transfers ${TRANSFERS} \
-              --checkers ${CHECKERS} \
-              --drive-use-trash=false \
-              --create-empty-src-dirs \
-              "src:$F" \
-              "$DEST/$F" &
-          done
-          wait
-          echo "✅ Folder trees backed up via rclone."
+    - name: Install Google client
+      if: steps.rclone-folders.outputs.folders_done == '1'
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.10"
+    - name: Copy seven spreadsheets
+      if: steps.rclone-folders.outputs.folders_done == '1'
+      run: |
+        python - <<'PY'
+        import os, logging, sys, json, datetime, pathlib
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
 
-      - name: Install Google API client
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+        # ---------- config ----------
+        DEST_PARENT = os.environ["WEEKLY_DEST_FOLDER"]
+        CREDS_FILE  = "creds.json"
+        FILE_IDS = [
+            "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M",
+            "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
+            "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4",
+            "1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s",
+            "1cE-eC__yz6bz931D3DyFj-ZyzJGIx-Ta",
+            "1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8",
+            "1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc",
+        ]
+        # ---------- logging ----------
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        log = logging.getLogger("sheets")
 
-      - name: Run spreadsheet backup
-        working-directory: web-portal-automator-src
-        run: python weekly_backup_files.py
+        # ---------- helpers ----------
+        def drive():
+            creds = service_account.Credentials.from_service_account_file(CREDS_FILE, scopes=["https://www.googleapis.com/auth/drive"])
+            return build("drive", "v3", credentials=creds)
+
+        def ensure_dated_folder(drv, parent, today):
+            q = f"'{parent}' in parents and mimeType='application/vnd.google-apps.folder' and name='{today}' and trashed=false"
+            res = drv.files().list(q=q, fields="files(id)", supportsAllDrives=True).execute()
+            if res.get("files"):
+                return res["files"][0]["id"]
+            folder = drv.files().create(
+                body={"name": today, "mimeType":"application/vnd.google-apps.folder", "parents":[parent]},
+                fields="id",
+                supportsAllDrives=True
+            ).execute()
+            return folder["id"]
+
+        # ---------- main ----------
+        try:
+            drv = drive()
+            today = datetime.datetime.utcnow().strftime("%d.%m.%Y")
+            backup_id = ensure_dated_folder(drv, DEST_PARENT, today)
+            for fid in FILE_IDS:
+                try:
+                    meta = drv.files().get(fileId=fid, fields="name", supportsAllDrives=True).execute()
+                    drv.files().copy(
+                        fileId=fid,
+                        body={"name": meta["name"], "parents":[backup_id]},
+                        supportsAllDrives=True
+                    ).execute()
+                    log.info("Copied %s", meta["name"])
+                except HttpError as e:
+                    log.warning("Skip %s : %s", fid, e)
+            log.info("✅ Spreadsheet copy complete")
+        except Exception:
+            log.exception("Spreadsheet backup failed")
+            sys.exit(1)
+        PY
+
+    - name: Finished
+      run: echo "✅ Weekly Drive backup (folders + sheets) finished."
