@@ -1,23 +1,20 @@
-name: Saturday Drive Backup (server‑side copy)
+name: Saturday Drive Backup (server‑side)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 18 * * 6"            # Saturdays 18 UTC
+    - cron: "0 18 * * 6"          # Saturdays 18 UTC
 
 jobs:
   backup:
     runs-on: ubuntu-latest
-
     env:
-      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"
-      CLEAN_DEST: "0"               # set 1 → full purge before copy
+      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"   # ← your backup root
+      CLEAN_DEST: "0"                                           # set 1 → purge before copy
 
     steps:
-    # repository with weekly_backup.py and credentials.json
     - uses: actions/checkout@v3
 
-    # ----- Python environment -----
     - uses: actions/setup-python@v4
       with:
         python-version: "3.10"
@@ -27,7 +24,6 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-    # ----- run backup script -----
     - name: Run weekly backup
       working-directory: web-portal-automator-src
       run: python weekly_backup.py
