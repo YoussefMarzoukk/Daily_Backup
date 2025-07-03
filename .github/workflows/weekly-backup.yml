@@ -1,29 +1,44 @@
-name: Saturday Drive Backup
+name: Saturday Drive Backup   # weekly snapshot of selected Drive folders/files
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # manual trigger
   schedule:
-    - cron: "0 18 * * 6"          # Saturdays 18 UTC
+    - cron: "0 18 * * 6"      # every Saturday 18 UTC
 
 jobs:
   backup:
     runs-on: ubuntu-latest
+
     env:
-      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"   # backup root in Drive
-      CLEAN_DEST: "0"                                           # set to 1 to purge first
+      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"   # parent folder for dated snapshots
+      CLEAN_DEST: "0"                                           # set to 1 to purge dated folder first
 
     steps:
+    # ──────────────────────────── source code ────────────────────────────
     - uses: actions/checkout@v3
 
+    # ─────────────────────── Python environment ──────────────────────────
     - uses: actions/setup-python@v4
       with:
         python-version: "3.10"
 
-    - name: Install Google client libraries
+    # ─────────────────── write service‑account key ───────────────────────
+    # Secret name is exactly “Key” (case‑sensitive)
+    - name: Create credentials.json from secret
+      env:
+        SA_JSON: ${{ secrets.Key }}
+      run: |
+        mkdir -p web-portal-automator-src
+        echo "$SA_JSON" > web-portal-automator-src/credentials.json
+        chmod 600 web-portal-automator-src/credentials.json
+
+    # ─────────────────── install Google client libs ──────────────────────
+    - name: Install libraries
       run: |
         python -m pip install --upgrade pip
         python -m pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
+    # ───────────────────────── run backup script ─────────────────────────
     - name: Run weekly backup
       working-directory: web-portal-automator-src
       run: python weekly_backup.py
