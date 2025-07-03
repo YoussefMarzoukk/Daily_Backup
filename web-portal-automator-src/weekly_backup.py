@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Fast, thread‑safe Google‑Drive backup
-─────────────────────────────────────
-• Recursively clones every folder ID in FOLDER_SOURCES (all sub‑folders
-  and files) and every single file ID in FILE_SOURCES.
-• Works entirely server‑side (files().copy) – no download/upload.
-• Uses a thread‑pool; each thread owns its own Drive client to avoid SSL
-  crashes.  MAX_WORKERS=8 is a good speed/quotas balance.  Raise if you
-  want more throughput and can tolerate the occasional automatic retry.
+Weekly Google‑Drive backup (thread‑safe, fast)
+
+• Copies every folder ID in FOLDER_SOURCES (all sub‑folders & files) and
+  every single file ID in FILE_SOURCES into
+     WEEKLY_DEST_FOLDER / <DD.MM.YYYY>
+• Uses server‑side `files().copy` – no data leaves Google’s backbone.
+• Up to MAX_WORKERS parallel file copies; folder traversal is sequential
+  to avoid giant thread storms.
 """
 
 from __future__ import annotations
-import os, sys, time, logging, threading, functools, concurrent.futures as cf
+import os, sys, time, logging, threading, queue, functools, concurrent.futures as cf
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -20,23 +20,20 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ── configuration ──────────────────────────────────────────────
+# ─── configuration ─────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
-DEST_PARENT = os.getenv("WEEKLY_DEST_FOLDER")         # required
-CLEAN_DEST  = os.getenv("CLEAN_DEST", "0") == "1"     # optional
+DEST_PARENT = os.getenv("WEEKLY_DEST_FOLDER")          # required
+MAX_WORKERS = int(os.getenv("BACKUP_THREADS", "8"))    # tweak freely
+PAGE_SIZE    = 1000                                    # Drive list page
 
-FOLDER_SOURCES = [   # full‑tree copies
+FOLDER_SOURCES = [
     "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb",
-    "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
     "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB",
-    "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
-    "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP",
     "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
 ]
-
-FILE_SOURCES = [     # stand‑alone spreadsheets
+FILE_SOURCES = [
     "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M",
     "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
     "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4",
@@ -45,18 +42,16 @@ FILE_SOURCES = [     # stand‑alone spreadsheets
     "1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8",
     "1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc",
 ]
-
-MAX_WORKERS = 8   # <-- raise to go faster, lower to reduce Drive 403s
-# ────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(message)s",
+    format="%(asctime)s %(levelname)-7s %(threadName)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 log = logging.getLogger("backup")
 
-# ── thread‑local Drive client ──────────────────────────────────
+# ─── thread‑local Drive client ─────────────────────────────────
 _tls = threading.local()
 
 
@@ -73,31 +68,31 @@ def drv():
     return _tls.drv
 
 
-# ── retry decorator (403/429 + SSL) ────────────────────────────
+# ─── retry decorator (rate‑limit & transient errors) ───────────
 def retry(fn):
     @functools.wraps(fn)
     def _wrap(*a, **kw):
         delay = 1
-        for attempt in range(8):
+        for attempt in range(7):
             try:
                 return fn(*a, **kw)
             except HttpError as e:
-                if e.resp.status in (403, 429):
+                if e.resp.status in (403, 429, 500, 503):
                     time.sleep(delay)
                     delay = min(delay * 2, 64)
                     continue
                 raise
             except Exception as e:
-                if attempt == 7:
+                if attempt == 6:
                     raise
-                log.warning("Transient error (%s) – retrying …", e)
+                log.warning("Transport error: %s – retrying …", e)
                 _tls.drv = _build_drive()
                 time.sleep(delay)
                 delay = min(delay * 2, 32)
     return _wrap
 
 
-# ── thin API helpers ───────────────────────────────────────────
+# ─── Drive wrappers ────────────────────────────────────────────
 @retry
 def gcopy(fid: str, *, name: str, parent: str):
     drv().files().copy(
@@ -113,7 +108,9 @@ def gcreate_folder(name: str, parent: str) -> str:
         drv()
         .files()
         .create(
-            body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]},
+            body={"name": name,
+                  "mimeType": "application/vnd.google-apps.folder",
+                  "parents": [parent]},
             fields="id",
             supportsAllDrives=True,
         )
@@ -128,127 +125,103 @@ def glist(folder_id: str, page_token: str | None):
         .files()
         .list(
             q=f"'{folder_id}' in parents and trashed=false",
-            fields=(
-                "nextPageToken,files(id,name,mimeType,shortcutDetails/targetId,"
-                "shortcutDetails/targetMimeType)"
-            ),
+            fields="nextPageToken,files(id,name,mimeType,shortcutDetails/targetId,"
+                   "shortcutDetails/targetMimeType)",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-            pageSize=1000,
+            pageSize=PAGE_SIZE,
             pageToken=page_token,
         )
         .execute()
     )
 
 
-# ── recursive copy ─────────────────────────────────────────────
-def copy_tree(src_id: str, dst_parent: str):
-    name = drv().files().get(fileId=src_id, fields="name", supportsAllDrives=True).execute()["name"]
-    dst_id = gcreate_folder(name, dst_parent)
-    log.info("↪ %s → %s", name, dst_id)
+# ─── sequential folder walk + parallel file copies ─────────────
+def walk_and_schedule(src_folder: str, dst_folder: str,
+                      pool: cf.ThreadPoolExecutor, skipped: list[str]):
+    q: queue.Queue[tuple[str, str]] = queue.Queue()
+    q.put((src_folder, dst_folder))
 
-    with cf.ThreadPoolExecutor(MAX_WORKERS) as pool:
-        _copy_contents(pool, src_id, dst_id)
-
-
-def _copy_contents(pool: cf.ThreadPoolExecutor, src: str, dst: str):
-    page = None
-    while True:
-        resp = glist(src, page)
-        for f in resp.get("files", []):
-            mt = f["mimeType"]
-            if mt == "application/vnd.google-apps.folder":
-                _copy_contents(pool, f["id"], gcreate_folder(f["name"], dst))
-            elif mt == "application/vnd.google-apps.shortcut":
-                tgt_id = f["shortcutDetails"]["targetId"]
-                tgt_mt = f["shortcutDetails"]["targetMimeType"]
-                alias = f["name"] + " (shortcut)"
-                if tgt_mt == "application/vnd.google-apps.folder":
-                    _copy_contents(pool, tgt_id, gcreate_folder(alias, dst))
+    while not q.empty():
+        src, dst = q.get()
+        page = None
+        while True:
+            resp = glist(src, page)
+            for f in resp.get("files", []):
+                mt = f["mimeType"]
+                if mt == "application/vnd.google-apps.folder":
+                    new_dst = gcreate_folder(f["name"], dst)
+                    q.put((f["id"], new_dst))
+                elif mt == "application/vnd.google-apps.shortcut":
+                    tgt = f["shortcutDetails"]["targetId"]
+                    tgt_mt = f["shortcutDetails"]["targetMimeType"]
+                    alias = f["name"] + " (shortcut)"
+                    if tgt_mt == "application/vnd.google-apps.folder":
+                        new_dst = gcreate_folder(alias, dst)
+                        q.put((tgt, new_dst))
+                    else:
+                        pool.submit(gcopy, tgt, name=alias, parent=dst)
                 else:
-                    pool.submit(gcopy, tgt_id, name=alias, parent=dst)
-            else:
-                pool.submit(gcopy, f["id"], name=f["name"], parent=dst)
-        page = resp.get("nextPageToken")
-        if not page:
-            break
+                    pool.submit(gcopy, f["id"], name=f["name"], parent=dst)
+            page = resp.get("nextPageToken")
+            if not page:
+                break
 
 
-# ── misc helpers ───────────────────────────────────────────────
-def delete_recursive(folder_id: str):
-    page = None
-    while True:
-        resp = glist(folder_id, page)
-        for f in resp.get("files", []):
-            if f["mimeType"] == "application/vnd.google-apps.folder":
-                delete_recursive(f["id"])
-            else:
-                drv().files().delete(fileId=f["id"]).execute()
-        page = resp.get("nextPageToken")
-        if not page:
-            break
-    drv().files().delete(fileId=folder_id).execute()
+# ─── helpers ───────────────────────────────────────────────────
+@retry
+def get_name(fid: str):
+    return drv().files().get(fileId=fid, fields="name",
+                             supportsAllDrives=True).execute()["name"]
 
 
-def ensure_dated(parent: str, today: str) -> str:
-    q = (
-        f"'{parent}' in parents and name='{today}' and mimeType='application/vnd.google-apps.folder' "
-        f"and trashed=false"
-    )
-    r = drv().files().list(q=q, fields="files(id)", supportsAllDrives=True).execute()
-    return r["files"][0]["id"] if r.get("files") else gcreate_folder(today, parent)
+def ensure_dated_folder(parent: str, date_str: str) -> str:
+    q = (f"'{parent}' in parents and name='{date_str}' "
+         "and mimeType='application/vnd.google-apps.folder' and trashed=false")
+    res = drv().files().list(q=q, fields="files(id)",
+                             supportsAllDrives=True).execute()
+    return res["files"][0]["id"] if res.get("files") else gcreate_folder(date_str, parent)
 
 
-def access_ok(fid: str):
-    try:
-        name = drv().files().get(fileId=fid, fields="name", supportsAllDrives=True).execute()["name"]
-        return True, name
-    except HttpError as e:
-        return False, ("not found" if e.resp.status == 404 else "forbidden")
-
-
-# ── entry‑point ────────────────────────────────────────────────
+# ─── main ──────────────────────────────────────────────────────
 def main():
     if not DEST_PARENT:
         log.error("WEEKLY_DEST_FOLDER env var not set"); sys.exit(1)
 
     today = datetime.utcnow().strftime("%d.%m.%Y")
-
-    if CLEAN_DEST:
-        q = f"'{DEST_PARENT}' in parents and name='{today}' and trashed=false"
-        r = drv().files().list(q=q, fields="files(id)", supportsAllDrives=True).execute()
-        if r.get("files"):
-            log.info("Purging previous snapshot …")
-            delete_recursive(r["files"][0]["id"])
-
-    backup_root = ensure_dated(DEST_PARENT, today)
-    log.info("Backup destination : %s (id=%s)", today, backup_root)
+    backup_root = ensure_dated_folder(DEST_PARENT, today)
+    log.info("Backup destination: %s (id=%s)", today, backup_root)
 
     skipped: List[str] = []
 
-    # folders
-    for fid in FOLDER_SOURCES:
-        ok, info = access_ok(fid)
-        if not ok:
-            skipped.append(f"{fid} – {info}"); log.warning("SKIP folder %s : %s", fid, info); continue
-        try: copy_tree(fid, backup_root)
-        except Exception as e:
-            skipped.append(f"{info} – {e}"); log.warning("Error copying %s : %s", info, e)
-
-    # files
     with cf.ThreadPoolExecutor(MAX_WORKERS) as pool:
-        futures=[]
+        # folders first (schedule their file copies)
+        for fid in FOLDER_SOURCES:
+            try:
+                name = get_name(fid)
+                log.info("Begin folder %s", name)
+                walk_and_schedule(fid, gcreate_folder(name, backup_root),
+                                  pool, skipped)
+                log.info("Done  folder %s", name)
+            except HttpError as e:
+                log.warning("Skip folder %s – %s", fid, e)
+                skipped.append(f"folder {fid} – {e}")
+        # single files
+        futures = []
         for fid in FILE_SOURCES:
-            ok, info = access_ok(fid)
-            if not ok:
-                skipped.append(f"{fid} – {info}"); log.warning("SKIP file %s : %s", fid, info); continue
-            futures.append(pool.submit(gcopy, fid, name=info, parent=backup_root))
-        for _ in cf.as_completed(futures): pass
+            try:
+                name = get_name(fid)
+                futures.append(pool.submit(gcopy, fid, name=name, parent=backup_root))
+            except HttpError as e:
+                skipped.append(f"file {fid} – {e}")
+        for _ in cf.as_completed(futures):
+            pass  # wait
 
-    log.info("✅ Backup complete.")
-    if skipped:
-        log.warning("Items skipped (%d):", len(skipped))
-        for s in skipped: log.warning(" • %s", s)
+    # summary
+    log.info("Skipped items (%d):", len(skipped))
+    for s in skipped:
+        log.info(" • %s", s)
+    log.info("✅ Backup complete with %d worker threads.", MAX_WORKERS)
 
 
 if __name__ == "__main__":
