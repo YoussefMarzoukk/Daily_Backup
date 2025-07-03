@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
-Weekly Google‑Drive backup  –  fast, resilient, self‑cleaning
-──────────────────────────────────────────────────────────────
-• Copies every folder ID in FOLDER_SOURCES (recursively) and every
-  single file ID in FILE_SOURCES into
-      WEEKLY_DEST_FOLDER / <DD.MM.YYYY>
-• Deletes snapshots older than KEEP_SNAPSHOTS to stay below the
-  15 GB free quota (or any quota you have).
-• Skips copies that hit Drive 'storageQuotaExceeded' instead of retrying
-  forever; other transient errors are retried with back‑off.
+Weekly Google‑Drive backup – fast, resilient, self‑cleaning
 """
 
 from __future__ import annotations
@@ -65,10 +57,9 @@ def _drive():
     return _tls.d
 
 # ─── helpers ───────────────────────────────────────────────────
-def _error_reason(err: HttpError) -> str | None:
+def _reason(err: HttpError) -> str | None:
     try:
-        reason = json.loads(err.content.decode())["error"]["errors"][0]["reason"]
-        return reason
+        return json.loads(err.content.decode())["error"]["errors"][0]["reason"]
     except Exception:
         return None
 
@@ -80,8 +71,8 @@ def retry(fn):
             try:
                 return fn(*a, **kw)
             except HttpError as e:
-                r = _error_reason(e)
-                if r in ("storageQuotaExceeded", "fileNotDownloadable"):   # don't retry
+                r = _reason(e)
+                if r in ("storageQuotaExceeded", "insufficientFilePermissions"):
                     raise
                 if e.resp.status in (403, 429, 500, 503):
                     time.sleep(delay)
@@ -96,7 +87,7 @@ def retry(fn):
                 delay = min(delay * 2, 32)
     return _wrap
 
-# ─── thin Drive wrappers ───────────────────────────────────────
+# ─── Drive wrappers ────────────────────────────────────────────
 @retry
 def gcopy(fid: str, *, name: str, parent: str):
     _drive().files().copy(
@@ -140,7 +131,15 @@ def get_name(fid: str) -> str:
     return _drive().files().get(fileId=fid, fields="name",
                                 supportsAllDrives=True).execute()["name"]
 
-# ─── snapshot clean‑up ─────────────────────────────────────────
+# ─── snapshot clean-up ─────────────────────────────────────────
+def _trash(file_id: str):
+    """Move file/folder to trash (works even without delete permission)."""
+    _drive().files().update(
+        fileId=file_id,
+        body={"trashed": True},
+        supportsAllDrives=True,
+    ).execute()
+
 def purge_old_snapshots(parent: str, keep: int):
     res = (
         _drive()
@@ -153,11 +152,18 @@ def purge_old_snapshots(parent: str, keep: int):
         )
         .execute()["files"]
     )
-    # dated names sort naturally dd.mm.yyyy
     to_delete = sorted(res, key=lambda f: f["createdTime"], reverse=True)[keep:]
     for f in to_delete:
-        log.info("Deleting old snapshot %s", f["name"])
-        _drive().files().delete(fileId=f["id"]).execute()
+        name = f["name"]
+        log.info("Deleting old snapshot %s", name)
+        try:
+            _drive().files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+        except HttpError as e:
+            if _reason(e) == "insufficientFilePermissions":
+                log.warning("No delete permission on %s – sending to trash instead", name)
+                _trash(f["id"])
+            else:
+                raise
 
 # ─── folder walk + scheduling copies ───────────────────────────
 def walk_and_schedule(src: str, dst: str, pool: cf.Executor, skipped: list[str]):
@@ -188,21 +194,20 @@ def _safe_copy(fid: str, name: str, parent: str, skipped: list[str]):
     try:
         gcopy(fid, name=name, parent=parent)
     except HttpError as e:
-        reason = _error_reason(e)
-        if reason == "storageQuotaExceeded":
-            log.warning("%s – skipped (quota full)", name)
-            skipped.append(f"{name} – quota full")
-        else:
-            log.warning("%s – skipped (%s)", name, reason or e)
-            skipped.append(f"{name} – {reason or e}")
+        r = _reason(e)
+        msg = r or str(e)
+        log.warning("%s – skipped (%s)", name, msg)
+        skipped.append(f"{name} – {msg}")
 
 # ─── main ──────────────────────────────────────────────────────
 def main():
     if not DEST_PARENT:
         log.error("WEEKLY_DEST_FOLDER env var not set"); sys.exit(1)
 
-    # purge old snapshots to free space
-    purge_old_snapshots(DEST_PARENT, KEEP_SNAPSHOTS)
+    try:
+        purge_old_snapshots(DEST_PARENT, KEEP_SNAPSHOTS)
+    except HttpError as e:
+        log.warning("Snapshot purge skipped: %s", e)
 
     today = datetime.utcnow().strftime("%d.%m.%Y")
     backup_root = gcreate_folder(today, DEST_PARENT)
@@ -218,8 +223,8 @@ def main():
                 walk_and_schedule(fid, gcreate_folder(name, backup_root), pool, skipped)
                 log.info("Done  folder %s", name)
             except HttpError as e:
-                log.warning("Skip folder %s – %s", fid, e)
                 skipped.append(f"folder {fid} – {e}")
+                log.warning("Skip folder %s – %s", fid, e)
 
         # single files
         futures = []
