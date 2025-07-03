@@ -1,4 +1,4 @@
-name: Saturday Drive Backup (server‑side)
+name: Saturday Drive Backup
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     env:
-      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"   # ← your backup root
-      CLEAN_DEST: "0"                                           # set 1 → purge before copy
+      WEEKLY_DEST_FOLDER: "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"   # backup root in Drive
+      CLEAN_DEST: "0"                                           # set to 1 to purge first
 
     steps:
     - uses: actions/checkout@v3
