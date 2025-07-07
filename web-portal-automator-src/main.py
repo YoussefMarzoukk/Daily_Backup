@@ -203,12 +203,18 @@
 #!/usr/bin/env python3
 #!/usr/bin/env python3
 #!/usr/bin/env python3
-"""Backup all Sheets / Excel files under SOURCE_FOLDER_ID
-   into DEST_FOLDER_ID/«DD.MM.YYYY».
+#!/usr/bin/env python3
+"""
+Daily backup of every Google Sheet / Excel under SOURCE_FOLDER_ID
+into DEST_FOLDER_ID/«DD.MM.YYYY».
 
-   • Tries to delete → trash → skip, never aborts on 403.
-   • Lists everything it could not delete/trash so you can
-     remove it manually in the Drive UI.
+ • Before copying it tries to delete → trash → skip every item already under
+   DEST_FOLDER_ID.  Anything it cannot even trash is merely skipped.
+ • At the end it prints direct Drive links for those “undeletable” leftovers.
+
+env vars required
+  SOURCE_FOLDER_ID   ... originals tree
+  DEST_FOLDER_ID     ... destination folder (or shared‑drive root)
 """
 import os, sys, logging
 from datetime import datetime
@@ -218,9 +224,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ────────────────────────────────────────────── constants
+# ─── constants ──────────────────────────────────────────────────────────────
 SCOPES       = ["https://www.googleapis.com/auth/drive"]
-CREDS_FILE   = Path(__file__).with_name("credentials.json")
+CREDS_FILE   = Path(__file__).with_name("credentials.json")     # or set GOOGLE_APPLICATION_CREDENTIALS
 GOOGLE_SHEET = "application/vnd.google-apps.spreadsheet"
 EXCEL_MIMES  = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -230,67 +236,75 @@ EXCEL_MIMES  = {
 }
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
 FLAGS        = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
-# ────────────────────────────────────────────── logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
-log = logging.getLogger("gdrive-backup")
+log = logging.getLogger("gdrive‑backup")
 
-# ────────────────────────────────────────────── helpers
+# ─── Google Drive service ───────────────────────────────────────────────────
 def drive_service():
     creds = service_account.Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-undeletable: list[str] = []            # items we could not even trash
+# ─── helper lists ───────────────────────────────────────────────────────────
+undeletable: list[tuple[str, str]] = []     # (id, name)
 
 
-def safe_remove(drive, fid: str):
-    """Try delete → trash → skip.  Record failures in `undeletable`."""
+# ─── resilient removal ──────────────────────────────────────────────────────
+def safe_remove(drive, fid: str, name: str):
+    """Delete → trash → record as undeletable (never raises for 403/404)."""
     try:
         drive.files().delete(fileId=fid, supportsAllDrives=True).execute()
         return
     except HttpError as e:
+        if e.resp.status == 404:
+            return                       # already gone
         if e.resp.status == 403 and "insufficientFilePermissions" in str(e):
             try:
                 drive.files().update(
                     fileId=fid, body={"trashed": True}, supportsAllDrives=True
                 ).execute()
-                log.warning("Moved to trash: %s", fid)
+                log.warning("Moved to trash (no rights to delete): %s", name)
                 return
             except HttpError as e2:
                 if e2.resp.status == 403:
-                    undeletable.append(fid)
-                    log.warning("Cannot trash or delete (skipped): %s", fid)
+                    undeletable.append((fid, name))
+                    log.warning("Skipped (cannot trash/delete): %s", name)
                     return
         raise
 
 
-def delete_folder_recursive(drive, folder_id: str):
+def delete_folder_recursive(drive, folder_id: str, folder_name: str):
     q = f"'{folder_id}' in parents and trashed=false"
     while True:
-        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **FLAGS).execute()
+        page = drive.files().list(
+            q=q, fields="nextPageToken,files(id,name,mimeType)", **FLAGS
+        ).execute()
         for f in page.get("files", []):
             if f["mimeType"] == "application/vnd.google-apps.folder":
-                delete_folder_recursive(drive, f["id"])
+                delete_folder_recursive(drive, f["id"], f["name"])
             else:
-                safe_remove(drive, f["id"])
+                safe_remove(drive, f["id"], f["name"])
         if not page.get("nextPageToken"):
             break
-    safe_remove(drive, folder_id)
+    safe_remove(drive, folder_id, folder_name)
 
 
 def wipe_destination(drive, dest_parent: str):
     log.info("Wiping existing content under DEST_FOLDER_ID …")
     q = f"'{dest_parent}' in parents and trashed=false"
     while True:
-        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **FLAGS).execute()
+        page = drive.files().list(
+            q=q, fields="nextPageToken,files(id,name,mimeType)", **FLAGS
+        ).execute()
         for f in page.get("files", []):
             if f["mimeType"] == "application/vnd.google-apps.folder":
-                delete_folder_recursive(drive, f["id"])
+                delete_folder_recursive(drive, f["id"], f["name"])
             else:
-                safe_remove(drive, f["id"])
+                safe_remove(drive, f["id"], f["name"])
         if not page.get("nextPageToken"):
             break
     try:
@@ -298,6 +312,8 @@ def wipe_destination(drive, dest_parent: str):
     except HttpError:
         pass  # not allowed for Content‑manager
 
+
+# ─── gather targets ─────────────────────────────────────────────────────────
 def gather_targets(drive, root_folder: str):
     found, seen, queue = {}, set(), deque([root_folder])
     while queue:
@@ -332,20 +348,24 @@ def gather_targets(drive, root_folder: str):
                 break
     return list(found.values())
 
-# ────────────────────────────────────────────── main
+# ─── main ────────────────────────────────────────────────────────────────────
 def main():
-    drive = drive_service()
-    src_root   = os.environ["SOURCE_FOLDER_ID"]
-    dst_parent = os.environ["DEST_FOLDER_ID"]
-    today      = datetime.utcnow().strftime("%d.%m.%Y")
+    drive       = drive_service()
+    src_root    = os.environ["SOURCE_FOLDER_ID"]
+    dst_parent  = os.environ["DEST_FOLDER_ID"]
+    today_label = datetime.utcnow().strftime("%d.%m.%Y")
 
     wipe_destination(drive, dst_parent)
 
     backup_id = drive.files().create(
-        body={"name": today, "mimeType": "application/vnd.google-apps.folder", "parents": [dst_parent]},
+        body={
+            "name": today_label,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [dst_parent],
+        },
         fields="id",
     ).execute()["id"]
-    log.info("Created backup folder %s (id=%s)", today, backup_id)
+    log.info("Created backup folder %s (id=%s)", today_label, backup_id)
 
     files = gather_targets(drive, src_root)
     log.info("Total spreadsheets/Excels found: %d", len(files))
@@ -373,8 +393,11 @@ def main():
         log.warning("Skipped source files:\n%s",
                     "\n".join(f" • {n} ({i})" for n, i in skipped))
     if undeletable:
-        log.warning("Could NOT delete/trash these items inside DEST_FOLDER_ID:\n%s",
-                    "\n".join(f" • https://drive.google.com/open?id={fid}" for fid in undeletable))
+        log.warning(
+            "Could NOT delete/trash these items inside DEST_FOLDER_ID "
+            "(remove them manually or give the service‑account Manager/Owner rights):\n%s",
+            "\n".join(f" • {n}  →  https://drive.google.com/open?id={fid}" for fid, n in undeletable)
+        )
 
 if __name__ == "__main__":
     try:
