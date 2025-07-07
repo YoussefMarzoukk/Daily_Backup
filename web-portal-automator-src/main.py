@@ -201,19 +201,18 @@
 # if __name__ == "__main__":
 #     main()
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Google Drive backup of all Sheets / Excel files under SOURCE_FOLDER_ID
-into a dated sub‑folder of DEST_FOLDER_ID.
+Drive backup of every Sheet / Excel under SOURCE_FOLDER_ID
+into DEST_FOLDER_ID/«DD.MM.YYYY».
 
-Before creating today’s folder it:
+• Deletes or at least trashes everything already inside DEST_FOLDER_ID first,
+  so there is room even if the SA lacks full delete rights.
+• Empties trash if the account has permission.
 
-1. Deletes EVERY existing child of DEST_FOLDER_ID   (automatic full wipe)
-2. Empties the account / shared‑drive trash         (storage really freed)
-
-Set in the environment:
-  SOURCE_FOLDER_ID   id of the tree that holds the originals
-  DEST_FOLDER_ID     id of the folder (or shared drive root) that will hold backups
-  GOOGLE_APPLICATION_CREDENTIALS or put credentials.json alongside this file
+env:
+  SOURCE_FOLDER_ID   originals tree
+  DEST_FOLDER_ID     destination folder or shared‑drive root
 """
 import os, sys, logging
 from datetime import datetime
@@ -225,18 +224,19 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-# ---------------------------------------------------------------------------
-SCOPES        = ["https://www.googleapis.com/auth/drive"]
-CREDENTIALS   = Path(__file__).with_name("credentials.json")
-GOOGLE_SHEET  = "application/vnd.google-apps.spreadsheet"
-EXCEL_MIMES   = {
+# ————————————————————————————————————————————————
+SCOPES       = ["https://www.googleapis.com/auth/drive"]
+CREDS_FILE   = Path(__file__).with_name("credentials.json")
+GOOGLE_SHEET = "application/vnd.google-apps.spreadsheet"
+EXCEL_MIMES  = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
     "application/vnd.ms-excel.sheet.macroEnabled.12",
     "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
 }
-TARGET_MIMES  = {GOOGLE_SHEET, *EXCEL_MIMES}
-# ---------------------------------------------------------------------------
+TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
+FLAGS        = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+# ————————————————————————————————————————————————
 
 logging.basicConfig(
     level=logging.INFO,
@@ -246,49 +246,61 @@ logging.basicConfig(
 log = logging.getLogger("gdrive‑backup")
 
 
-def get_service():
-    creds = service_account.Credentials.from_service_account_file(CREDENTIALS, scopes=SCOPES)
+def drive_service():
+    creds = service_account.Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def delete_folder_recursive(drive, folder_id: str) -> None:
-    """Delete a folder and all its contents (recursively)."""
-    q = f"'{folder_id}' in parents and trashed = false"
-    flags = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+# ----- resilient removal -----------------------------------------------------
+def safe_remove(drive, fid: str):
+    """Permanently delete; if not allowed, move to trash."""
+    try:
+        drive.files().delete(fileId=fid, supportsAllDrives=True).execute()
+    except HttpError as e:
+        if e.resp.status == 403 and "insufficientFilePermissions" in str(e):
+            drive.files().update(fileId=fid, body={"trashed": True}, supportsAllDrives=True).execute()
+            log.warning("Moved to trash (no rights to delete): %s", fid)
+        else:
+            raise
+
+
+# ----- recursive folder removal using safe_remove ---------------------------
+def delete_folder_recursive(drive, folder_id: str):
+    q = f"'{folder_id}' in parents and trashed=false"
     while True:
-        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **flags).execute()
+        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **FLAGS).execute()
         for f in page.get("files", []):
             if f["mimeType"] == "application/vnd.google-apps.folder":
                 delete_folder_recursive(drive, f["id"])
             else:
-                drive.files().delete(fileId=f["id"]).execute()
+                safe_remove(drive, f["id"])
         if not page.get("nextPageToken"):
             break
-    drive.files().delete(fileId=folder_id).execute()
+    safe_remove(drive, folder_id)
 
 
-def wipe_destination(drive, dest_parent: str) -> None:
-    """Remove *all* children of DEST_FOLDER_ID, then purge trash."""
+# ----- wipe destination then empty trash ------------------------------------
+def wipe_destination(drive, dest_parent: str):
     log.info("Wiping existing content under DEST_FOLDER_ID …")
-    q = f"'{dest_parent}' in parents and trashed = false"
-    flags = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+    q = f"'{dest_parent}' in parents and trashed=false"
     while True:
-        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **flags).execute()
+        page = drive.files().list(q=q, fields="nextPageToken,files(id,mimeType)", **FLAGS).execute()
         for f in page.get("files", []):
             if f["mimeType"] == "application/vnd.google-apps.folder":
                 delete_folder_recursive(drive, f["id"])
             else:
-                drive.files().delete(fileId=f["id"]).execute()
+                safe_remove(drive, f["id"])
         if not page.get("nextPageToken"):
             break
-    log.info("Emptying Drive trash …")
-    drive.files().emptyTrash().execute()      # <- frees the quota immediately
+    try:
+        drive.files().emptyTrash().execute()
+    except HttpError:
+        pass  # not always permitted
 
 
-def gather_targets(drive, root_folder: str) -> list[dict]:
-    """Return every Google Sheet *or* Excel file under root_folder (recursive, shortcut‑aware)."""
+# ----- gather targets --------------------------------------------------------
+def gather_targets(drive, root_folder: str):
     found, seen, queue = {}, set(), deque([root_folder])
-    flags = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
     while queue:
         fid = queue.popleft()
         if fid in seen:
@@ -299,9 +311,10 @@ def gather_targets(drive, root_folder: str) -> list[dict]:
         while True:
             resp = drive.files().list(
                 q=f"'{fid}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,mimeType,shortcutDetails/targetId,shortcutDetails/targetMimeType)",
+                fields=("nextPageToken,files(id,name,mimeType,"
+                        "shortcutDetails/targetId,shortcutDetails/targetMimeType)"),
                 pageToken=page_token,
-                **flags,
+                **FLAGS,
             ).execute()
 
             for f in resp.get("files", []):
@@ -321,29 +334,19 @@ def gather_targets(drive, root_folder: str) -> list[dict]:
     return list(found.values())
 
 
+# ----- main ------------------------------------------------------------------
 def main():
-    drive = get_service()
+    drive = drive_service()
     src_root   = os.environ["SOURCE_FOLDER_ID"]
     dst_parent = os.environ["DEST_FOLDER_ID"]
     today      = datetime.utcnow().strftime("%d.%m.%Y")
 
-    # ---------------------------------------------------------------
-    wipe_destination(drive, dst_parent)              # <‑‑ frees space first
-    # ---------------------------------------------------------------
+    wipe_destination(drive, dst_parent)
 
-    # create today’s backup folder
-    backup_id = (
-        drive.files()
-        .create(
-            body={
-                "name": today,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [dst_parent],
-            },
-            fields="id",
-        )
-        .execute()["id"]
-    )
+    backup_id = drive.files().create(
+        body={"name": today, "mimeType": "application/vnd.google-apps.folder", "parents": [dst_parent]},
+        fields="id",
+    ).execute()["id"]
     log.info("Created backup folder %s (id=%s)", today, backup_id)
 
     files = gather_targets(drive, src_root)
@@ -369,8 +372,7 @@ def main():
 
     log.info("Backup finished: %d copied, %d skipped", len(files) - len(skipped), len(skipped))
     if skipped:
-        log.warning("Skipped files:\n%s",
-                    "\n".join(f" • {n} ({i})" for n, i in skipped))
+        log.warning("Skipped files:\n%s", "\n".join(f" • {n} ({i})" for n, i in skipped))
 
 
 if __name__ == "__main__":
