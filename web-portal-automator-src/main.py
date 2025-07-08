@@ -417,3 +417,21 @@ def main() -> None:
             except HttpError as e:
                 status = getattr(e.resp, "status", None)
                 if status == 403:
+                    # fallback: create a shortcut so nothing is lost
+                    create_shortcut(drive, f["id"], f["name"], backup_id)
+                    log.info("Quota hit; created shortcut for %s", f["name"])
+                else:
+                    raise
+
+        log.info("Backup complete 🎉")
+
+    except HttpError as e:
+        log.error("Google API error: %s", e)
+        sys.exit(1)
+    except Exception:
+        log.exception("Unexpected error")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
