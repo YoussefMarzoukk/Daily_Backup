@@ -196,6 +196,8 @@
 #     except Exception:
 #         log.exception("Unexpected error")
 #         sys.exit(1)
+# if __name__ == "__main__":
+#     main()
 import os
 import sys
 import io
@@ -212,6 +214,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 # --------------------------------------------------
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
+
 GOOGLE_SHEET = "application/vnd.google-apps.spreadsheet"
 EXCEL_MIMES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
@@ -272,8 +275,10 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
         while True:
             resp = drive.files().list(
                 q=f"'{fid}' in parents and trashed=false",
-                fields=("nextPageToken, files(id,name,mimeType,"
-                        "shortcutDetails/targetId,shortcutDetails/targetMimeType)"),
+                fields=(
+                    "nextPageToken, files(id,name,mimeType,"
+                    "shortcutDetails/targetId,shortcutDetails/targetMimeType)"
+                ),
                 pageToken=page_token,
                 **flags,
             ).execute()
@@ -286,7 +291,7 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
                     queue.append(f["id"])
                     continue
 
-                # native files we want
+                # native files
                 if mt in TARGET_MIMES:
                     found[f["id"]] = {
                         "id": f["id"],
@@ -295,7 +300,7 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
                     }
                     continue
 
-                # shortcuts to native files
+                # shortcuts → follow to target
                 if mt == "application/vnd.google-apps.shortcut":
                     tgt_mt = f["shortcutDetails"]["targetMimeType"]
                     if tgt_mt in TARGET_MIMES:
@@ -312,19 +317,32 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
     return list(found.values())
 
 
+def create_shortcut(drive, target_id: str, name: str, parent_folder: str):
+    body = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.shortcut",
+        "shortcutDetails": {"targetId": target_id},
+        "parents": [parent_folder],
+    }
+    drive.files().create(
+        body=body,
+        supportsAllDrives=True,
+        fields="id"
+    ).execute()
+
+
 def main() -> None:
     try:
         creds = service_account.Credentials.from_service_account_file(
             CREDENTIALS_FILE, scopes=SCOPES
         )
-        # disable discovery cache to suppress that INFO line
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
         src_root = os.environ["SOURCE_FOLDER_ID"]
         dst_parent = os.environ["DEST_FOLDER_ID"]
         today = datetime.utcnow().strftime("%d.%m.%Y")
 
-        # wipe old backup if present
+        # ─── wipe old folder ─────────────────────────────
         existing = drive.files().list(
             q=(f"'{dst_parent}' in parents and "
                "mimeType='application/vnd.google-apps.folder' "
@@ -337,7 +355,7 @@ def main() -> None:
             log.info("Deleting existing backup folder %s …", today)
             delete_folder_recursive(drive, existing["files"][0]["id"])
 
-        # create new dated folder
+        # ─── create new backup folder ─────────────────────
         backup_id = drive.files().create(
             body={
                 "name": today,
@@ -349,27 +367,28 @@ def main() -> None:
         ).execute()["id"]
         log.info("Created backup folder %s (id=%s)", today, backup_id)
 
-        # gather targets
+        # ─── find all Sheets & Excels ────────────────────
         files = gather_spreadsheets_and_excels(drive, src_root)
         log.info("Total spreadsheets/Excels found: %d", len(files))
 
-        skipped = []
         for f in files:
             try:
                 if f["mimeType"] in EXCEL_MIMES:
-                    # download the Excel
+                    # download Excel
                     fh = io.BytesIO()
-                    req = drive.files().get_media(
-                        fileId=f["id"],
-                        supportsAllDrives=True
+                    downloader = MediaIoBaseDownload(
+                        fh,
+                        drive.files().get_media(
+                            fileId=f["id"],
+                            supportsAllDrives=True
+                        )
                     )
-                    downloader = MediaIoBaseDownload(fh, req)
                     done = False
                     while not done:
                         _, done = downloader.next_chunk()
                     fh.seek(0)
 
-                    # re-upload & convert to Google Sheet
+                    # upload as Google Sheet
                     media = MediaIoBaseUpload(
                         fh,
                         mimetype=f["mimeType"],
@@ -384,10 +403,10 @@ def main() -> None:
                         media_body=media,
                         supportsAllDrives=True,
                     ).execute()
-                    log.info("Converted and imported %s", f["name"])
+                    log.info("Converted and copied %s", f["name"])
 
                 else:
-                    # native Google Sheet
+                    # native Sheet → copy directly
                     drive.files().copy(
                         fileId=f["id"],
                         body={"name": f["name"], "parents": [backup_id]},
@@ -397,39 +416,4 @@ def main() -> None:
 
             except HttpError as e:
                 status = getattr(e.resp, "status", None)
-                reason = getattr(e.error_details[0], "get", lambda k, d=None: d)("reason","")
-                if status in (403, 404):
-                    log.warning(
-                        "Skipped %s (id=%s) — %s",
-                        f["name"],
-                        f["id"],
-                        "not accessible" if status == 403 else "not found",
-                    )
-                    skipped.append((f["name"], f["id"]))
-                    continue
-                raise
-
-        log.info(
-            "Backup finished: %d copied/converted, %d skipped",
-            len(files) - len(skipped),
-            len(skipped),
-        )
-        if skipped:
-            log.warning("Skipped files:\n%s",
-                        "\n".join(f" • {n} ({i})" for n, i in skipped))
-
-    except HttpError as e:
-        log.error("Google API error: %s", e)
-        sys.exit(1)
-    except Exception:
-        log.exception("Unexpected error")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-# if __name__ == "__main__":
-#     main()
+                if status == 403:
