@@ -198,8 +198,10 @@
 #         sys.exit(1)
 # if __name__ == "__main__":
 #     main()
+#!/usr/bin/env python3
 import os
 import sys
+import io
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -208,8 +210,11 @@ from collections import deque
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# --------------------------------------------------
+# ----------------------------------------
+# CONFIG
+# ----------------------------------------
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
@@ -221,7 +226,6 @@ EXCEL_MIMES = {
     "application/vnd.ms-excel.sheet.binary.macroEnabled.12",              # .xlsb
 }
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
-# --------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -231,8 +235,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def delete_folder_recursive(drive, folder_id: str) -> None:
-    """Delete a folder and all its contents, recursively."""
+def delete_folder_recursive(drive, folder_id: str):
+    """Recursively delete a folder and all its contents."""
     children = drive.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id,mimeType)",
@@ -240,23 +244,15 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
         includeItemsFromAllDrives=True,
         pageSize=1000,
     ).execute().get("files", [])
-
     for ch in children:
         if ch["mimeType"] == "application/vnd.google-apps.folder":
             delete_folder_recursive(drive, ch["id"])
         else:
-            drive.files().delete(
-                fileId=ch["id"],
-                supportsAllDrives=True
-            ).execute()
-
-    drive.files().delete(
-        fileId=folder_id,
-        supportsAllDrives=True
-    ).execute()
+            drive.files().delete(fileId=ch["id"], supportsAllDrives=True).execute()
+    drive.files().delete(fileId=folder_id, supportsAllDrives=True).execute()
 
 
-def empty_service_account_drive(drive) -> None:
+def empty_service_account_drive(drive):
     """
     Permanently delete every item in the service account's My Drive,
     then empty the trash to reclaim all storage.
@@ -278,16 +274,16 @@ def empty_service_account_drive(drive) -> None:
             if itm["mimeType"] == "application/vnd.google-apps.folder":
                 delete_folder_recursive(drive, itm["id"])
             else:
-                drive.files().delete(
-                    fileId=itm["id"],
-                    supportsAllDrives=True
-                ).execute()
+                drive.files().delete(fileId=itm["id"], supportsAllDrives=True).execute()
         drive.files().emptyTrash().execute()
         log.info("Service account My Drive emptied.")
 
 
-def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
-    """Return every Google Sheet *or* Excel file under root_folder."""
+def gather_spreadsheets_and_excels(drive, root_folder: str):
+    """
+    Recursively find all Google Sheets and Excel files (incl. shortcuts)
+    under the given folder.
+    """
     found = {}
     visited = set()
     queue = deque([root_folder])
@@ -307,14 +303,17 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
         while True:
             resp = drive.files().list(
                 q=f"'{fid}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,mimeType,shortcutDetails/targetId,shortcutDetails/targetMimeType)",
+                fields=(
+                    "nextPageToken,"
+                    "files(id,name,mimeType,"
+                    "shortcutDetails/targetId,shortcutDetails/targetMimeType)"
+                ),
                 pageToken=page_token,
                 **flags
             ).execute()
 
             for f in resp.get("files", []):
                 mt = f["mimeType"]
-
                 if mt == "application/vnd.google-apps.folder":
                     queue.append(f["id"])
                 elif mt in TARGET_MIMES:
@@ -323,7 +322,11 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
                     tgt_mt = f["shortcutDetails"]["targetMimeType"]
                     if tgt_mt in TARGET_MIMES:
                         tid = f["shortcutDetails"]["targetId"]
-                        found[tid] = {"id": tid, "name": f["name"] + " (shortcut)", "mimeType": tgt_mt}
+                        found[tid] = {
+                            "id": tid,
+                            "name": f["name"] + " (shortcut)",
+                            "mimeType": tgt_mt
+                        }
 
             page_token = resp.get("nextPageToken")
             if not page_token:
@@ -332,29 +335,30 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
     return list(found.values())
 
 
-def main() -> None:
+def main():
     try:
-        # Authenticate
+        # 1) AUTH
         creds = service_account.Credentials.from_service_account_file(
             CREDENTIALS_FILE, scopes=SCOPES
         )
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-        # ——— STORAGE CHECK ———
+        # 2) STORAGE QUOTA CHECK
         about = drive.about().get(fields="storageQuota(limit,usage)").execute()
+        used  = int(about["storageQuota"].get("usage", 0))
         limit = int(about["storageQuota"].get("limit", 0))
-        used = int(about["storageQuota"].get("usage", 0))
-        log.info("Drive quota: %d bytes used / %d bytes limit", used, limit)
+        limit_str = f"{limit} bytes" if limit > 0 else "unlimited"
+        log.info("Drive quota: %d bytes used / %s limit", used, limit_str)
 
-        # 1) Clean out service account's My Drive (but not your backup folder)
+        # 3) CLEAN SERVICE-ACCOUNT My Drive
         empty_service_account_drive(drive)
 
-        # 2) Run your normal backup into DEST_FOLDER_ID
+        # 4) BACKUP into DEST_FOLDER_ID
         src_root   = os.environ["SOURCE_FOLDER_ID"]
         dst_parent = os.environ["DEST_FOLDER_ID"]
         today      = datetime.utcnow().strftime("%d.%m.%Y")
 
-        # create today’s folder
+        # create today’s folder under your backup location
         backup_id = drive.files().create(
             body={
                 "name": today,
@@ -372,12 +376,41 @@ def main() -> None:
         skipped = []
         for f in files:
             try:
-                drive.files().copy(
-                    fileId=f["id"],
-                    body={"name": f["name"], "parents": [backup_id]},
-                    supportsAllDrives=True,
-                ).execute()
-                log.info("Copied %s", f["name"])
+                if f["mimeType"] in EXCEL_MIMES:
+                    # download the binary
+                    fh = io.BytesIO()
+                    req = drive.files().get_media(
+                        fileId=f["id"], supportsAllDrives=True
+                    )
+                    downloader = MediaIoBaseDownload(fh, req)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                    fh.seek(0)
+
+                    # re-upload into backup folder
+                    media = MediaIoBaseUpload(
+                        fh, mimetype=f["mimeType"], resumable=True
+                    )
+                    drive.files().create(
+                        body={
+                            "name": f["name"],
+                            "parents": [backup_id],
+                        },
+                        media_body=media,
+                        supportsAllDrives=True,
+                    ).execute()
+                    log.info("Backed up Excel %s", f["name"])
+
+                else:
+                    # native Google Sheet
+                    drive.files().copy(
+                        fileId=f["id"],
+                        body={"name": f["name"], "parents": [backup_id]},
+                        supportsAllDrives=True,
+                    ).execute()
+                    log.info("Copied Sheet %s", f["name"])
+
             except HttpError as e:
                 if e.resp.status in (403, 404):
                     log.warning(
@@ -390,7 +423,7 @@ def main() -> None:
                     raise
 
         log.info(
-            "Backup finished: %d copied, %d skipped",
+            "Backup complete: %d files backed up, %d skipped",
             len(files) - len(skipped), len(skipped)
         )
         if skipped:
