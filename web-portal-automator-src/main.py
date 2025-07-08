@@ -261,7 +261,6 @@ def empty_service_account_drive(drive) -> None:
     Permanently delete every item in the service account's My Drive,
     then empty the trash to reclaim all storage.
     """
-    # List everything in root
     resp = drive.files().list(
         q="'root' in parents and trashed=false",
         fields="files(id,name,mimeType)",
@@ -283,13 +282,12 @@ def empty_service_account_drive(drive) -> None:
                     fileId=itm["id"],
                     supportsAllDrives=True
                 ).execute()
-        # Now empty the trash
         drive.files().emptyTrash().execute()
         log.info("Service account My Drive emptied.")
 
 
 def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
-    """Return every Google Sheet *or* Excel file under root_folder (recursive, shortcut-aware)."""
+    """Return every Google Sheet *or* Excel file under root_folder."""
     found = {}
     visited = set()
     queue = deque([root_folder])
@@ -336,20 +334,27 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
 
 def main() -> None:
     try:
+        # Authenticate
         creds = service_account.Credentials.from_service_account_file(
             CREDENTIALS_FILE, scopes=SCOPES
         )
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-        # 1) Wipe out anything in the service account's My Drive (but NOT your backup folder)
+        # ——— STORAGE CHECK ———
+        about = drive.about().get(fields="storageQuota(limit,usage)").execute()
+        limit = int(about["storageQuota"].get("limit", 0))
+        used = int(about["storageQuota"].get("usage", 0))
+        log.info("Drive quota: %d bytes used / %d bytes limit", used, limit)
+
+        # 1) Clean out service account's My Drive (but not your backup folder)
         empty_service_account_drive(drive)
 
-        # 2) Proceed with your normal backup into the shared DEST_FOLDER_ID
-        src_root = os.environ["SOURCE_FOLDER_ID"]
+        # 2) Run your normal backup into DEST_FOLDER_ID
+        src_root   = os.environ["SOURCE_FOLDER_ID"]
         dst_parent = os.environ["DEST_FOLDER_ID"]
-        today = datetime.utcnow().strftime("%d.%m.%Y")
+        today      = datetime.utcnow().strftime("%d.%m.%Y")
 
-        # create new dated folder (no need to delete anything in DST_PARENT)
+        # create today’s folder
         backup_id = drive.files().create(
             body={
                 "name": today,
@@ -361,7 +366,6 @@ def main() -> None:
         ).execute()["id"]
         log.info("Created backup folder %s (id=%s)", today, backup_id)
 
-        # gather and copy
         files = gather_spreadsheets_and_excels(drive, src_root)
         log.info("Total spreadsheets/Excels found: %d", len(files))
 
@@ -405,8 +409,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-if __name__ == "__main__":
-    main()
-
