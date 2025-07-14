@@ -1,50 +1,43 @@
 """
-backup_selected_drive_items.py
-──────────────────────────────
-Copies a fixed set of Google Drive folders / spreadsheets (listed below)
-into a dated sub‑folder of the destination folder *every time the script
-runs*.  Older dated backups beyond KEEP newest are deleted first so the
-service‑account’s 15 GB quota never fills up.
+weekly_backup.py
+────────────────
+Back up a fixed list of Google Drive folders / spreadsheets into a dated
+sub‑folder of the destination folder.  Older backups beyond KEEP newest
+are deleted first so the service‑account’s 15 GB quota never fills up.
 
-• Authenticate with the same service‑account JSON you already store as
-  credentials.json next to this script.
-• Set environment variable DEST_FOLDER_ID to the ID of your target folder
-  (see constant SOURCES for the source IDs already embedded).
-
-Run:
-    python backup_selected_drive_items.py
+• Put service‑account JSON next to this file and name it credentials.json
+• Run:  python weekly_backup.py
 """
 
-import os
-import sys
 import logging
+import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from collections import deque
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # =======================================================================
-# CONFIGURATION ----------------------------------------------------------
+# CONSTANTS / SETTINGS --------------------------------------------------
 SCOPES           = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
-KEEP      = 5              # keep this many most‑recent dated backups
-DATE_FMT  = "%d.%m.%Y"     # folder‑name pattern used for each run
-
+DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # <<< target folder
+KEEP           = 5                # keep this many most‑recent backups
+DATE_FMT       = "%d.%m.%Y"       # folder‑name pattern you want
 # -----------------------------------------------------------------------
-# IDs of the folders / spreadsheets you want to back up
+# IDs of the folders / spreadsheets to back up
 SOURCES = [
-    # ----- folders -----
+    # ─── folders ───
     "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb",
     "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
     "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB",
     "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
     "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP",
     "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
-    # ----- spreadsheets -----
+    # ─── spreadsheets ───
     "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M",
     "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
     "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4",
@@ -66,7 +59,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ---- MIME constants ----------------------------------------------------
 GOOGLE_SHEET = "application/vnd.google-apps.spreadsheet"
 EXCEL_MIMES  = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -76,7 +68,6 @@ EXCEL_MIMES  = {
 }
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
 FOLDER_MIME  = "application/vnd.google-apps.folder"
-# ------------------------------------------------------------------------
 
 
 # ---------- helpers -----------------------------------------------------
@@ -107,11 +98,11 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
     safe_delete(drive, folder_id)
 
 
-def purge_old_backups(drive, dest_parent: str) -> None:
-    """Delete dated backup folders owned by SA beyond KEEP newest."""
+def purge_old_backups(drive) -> None:
+    """Delete dated backup folders beyond KEEP newest."""
     resp = drive.files().list(
         q=(
-            f"'{dest_parent}' in parents and mimeType='{FOLDER_MIME}' "
+            f"'{DEST_FOLDER_ID}' in parents and mimeType='{FOLDER_MIME}' "
             "and trashed=false and 'me' in owners"
         ),
         fields="files(id,name)",
@@ -137,13 +128,13 @@ def purge_old_backups(drive, dest_parent: str) -> None:
 def gather_target_files(drive, root_folder: str) -> list[dict]:
     """Return every Google Sheet or Excel under root_folder (recursive)."""
     found, visited = {}, set()
-    q = deque([root_folder])
+    queue = deque([root_folder])
     flags = dict(
         supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000
     )
 
-    while q:
-        fid = q.popleft()
+    while queue:
+        fid = queue.popleft()
         if fid in visited:
             continue
         visited.add(fid)
@@ -159,10 +150,11 @@ def gather_target_files(drive, root_folder: str) -> list[dict]:
                 pageToken=page_token,
                 **flags,
             ).execute()
+
             for f in resp.get("files", []):
                 mt = f["mimeType"]
                 if mt == FOLDER_MIME:
-                    q.append(f["id"])
+                    queue.append(f["id"])
                 elif mt in TARGET_MIMES:
                     found[f["id"]] = f
                 elif mt == "application/vnd.google-apps.shortcut":
@@ -180,38 +172,38 @@ def gather_target_files(drive, root_folder: str) -> list[dict]:
 
 
 def main() -> None:
-    dest_parent = os.environ.get("DEST_FOLDER_ID")
-    if not dest_parent:
-        log.error("Set DEST_FOLDER_ID environment variable")
-        sys.exit(1)
-
     try:
         creds = service_account.Credentials.from_service_account_file(
             CREDENTIALS_FILE, scopes=SCOPES
         )
         drive = build("drive", "v3", credentials=creds)
     except Exception:
-        log.exception("Auth failed")
+        log.exception("Authentication failed")
         sys.exit(1)
 
     today = datetime.utcnow().strftime(DATE_FMT)
 
     # -- 1. free quota -----------------------------------------------------
-    purge_old_backups(drive, dest_parent)
+    purge_old_backups(drive)
 
-    # -- 2. create today’s root backup folder -----------------------------
+    # -- 2. create today’s backup root ------------------------------------
     backup_root = drive.files().create(
         body={
             "name": today,
             "mimeType": FOLDER_MIME,
-            "parents": [dest_parent],
+            "parents": [DEST_FOLDER_ID],
         },
         fields="id",
     ).execute()["id"]
     log.info("Created daily backup folder %s (id=%s)", today, backup_root)
 
-    # -- 3. process each source ID ----------------------------------------
+    # -- 3. iterate over sources ------------------------------------------
+    seen = set()  # handle accidental duplicates
     for src_id in SOURCES:
+        if src_id in seen:
+            continue
+        seen.add(src_id)
+
         try:
             meta = drive.files().get(
                 fileId=src_id,
@@ -223,37 +215,29 @@ def main() -> None:
             log.warning("Cannot access %s — %s", src_id, e)
             continue
 
-        name = meta["name"]
-        mt   = meta["mimeType"]
+        name, mt = meta["name"], meta["mimeType"]
 
-        # -------- folder source ------------------------------------------
         if mt == FOLDER_MIME:
             log.info("Scanning folder %s …", name)
-            dst_folder_id = drive.files().create(
-                body={
-                    "name": name,
-                    "mimeType": FOLDER_MIME,
-                    "parents": [backup_root],
-                },
+            dst_folder = drive.files().create(
+                body={"name": name, "mimeType": FOLDER_MIME, "parents": [backup_root]},
                 fields="id",
             ).execute()["id"]
 
-            # collect spreadsheets/Excels in that folder tree
             files = gather_target_files(drive, src_id)
-            log.info("  %d target files found", len(files))
+            log.info("  %d spreadsheet/Excel files found", len(files))
 
             for f in files:
                 try:
                     drive.files().copy(
                         fileId=f["id"],
-                        body={"name": f["name"], "parents": [dst_folder_id]},
+                        body={"name": f["name"], "parents": [dst_folder]},
                         supportsAllDrives=True,
                     ).execute()
                     log.info("  Copied %s", f["name"])
                 except HttpError as e:
                     log.warning("  Skip %s — %s", f["name"], e)
 
-        # -------- single spreadsheet / Excel -----------------------------
         elif mt in TARGET_MIMES:
             try:
                 drive.files().copy(
