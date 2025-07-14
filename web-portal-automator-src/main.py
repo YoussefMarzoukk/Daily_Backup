@@ -201,11 +201,13 @@
 # if __name__ == "__main__":
 #     main()
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Back up every Google Sheet or Excel file found under SOURCE_FOLDER_ID
-into a dated folder inside DEST_FOLDER_ID (both env vars).
+into a dated sub‑folder of the fixed destination folder
+`1FVa6HFoI3HSsgtGbbkT8BNPkZXFIz1rF` (shared drive).
 
-✓ Works with shared drives – every write request carries supportsAllDrives=True.
+✓ Fully shared‑drive‑compatible (`supportsAllDrives=True` everywhere).
 """
 import os
 import sys
@@ -222,14 +224,12 @@ from googleapiclient.errors import HttpError
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
-READ_FLAGS = dict(            # for list() calls
+READ_FLAGS = dict(
     supportsAllDrives=True,
     includeItemsFromAllDrives=True,
     pageSize=1000,
 )
-WRITE_FLAGS = dict(           # for create(), copy(), delete()
-    supportsAllDrives=True,
-)
+WRITE_FLAGS = dict(supportsAllDrives=True)
 # --------------------------------------------------
 
 logging.basicConfig(
@@ -242,17 +242,20 @@ log = logging.getLogger(__name__)
 # ---------- file types we want ----------
 GOOGLE_SHEET = "application/vnd.google-apps.spreadsheet"
 EXCEL_MIMES = {
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
-    "application/vnd.ms-excel",                                           # .xls
-    "application/vnd.ms-excel.sheet.macroEnabled.12",                     # .xlsm
-    "application/vnd.ms-excel.sheet.binary.macroEnabled.12",              # .xlsb
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
 }
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
 # ----------------------------------------
 
+# -------- FIXED DESTINATION FOLDER --------
+DEST_PARENT_ID = "1FVa6HFoI3HSsgtGbbkT8BNPkZXFIz1rF"   # ← put dated backups here
+# -----------------------------------------
+
 
 def delete_folder_recursive(drive, folder_id: str) -> None:
-    """Delete a folder and all its contents."""
     children = (
         drive.files()
         .list(
@@ -272,16 +275,14 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
 
 
 def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
-    """Return every Google Sheet *or* Excel file under root_folder (recursive, shortcut‑aware)."""
-    found: dict[str, dict] = {}
-    visited_folders: set[str] = set()
+    found, visited = {}, set()
     queue = deque([root_folder])
 
     while queue:
         fid = queue.popleft()
-        if fid in visited_folders:
+        if fid in visited:
             continue
-        visited_folders.add(fid)
+        visited.add(fid)
 
         page_token = None
         while True:
@@ -302,30 +303,18 @@ def gather_spreadsheets_and_excels(drive, root_folder: str) -> list[dict]:
             for f in resp.get("files", []):
                 mt = f["mimeType"]
 
-                # ---- recurse into sub‑folders ----
                 if mt == "application/vnd.google-apps.folder":
                     queue.append(f["id"])
-                    continue
-
-                # ---- native files we want ----
-                if mt in TARGET_MIMES:
+                elif mt in TARGET_MIMES:
                     found[f["id"]] = f
-                    continue
-
-                # ---- shortcuts we care about ----
-                if mt == "application/vnd.google-apps.shortcut":
+                elif mt == "application/vnd.google-apps.shortcut":
                     tgt_mt = f["shortcutDetails"]["targetMimeType"]
                     if tgt_mt in TARGET_MIMES:
                         tgt_id = f["shortcutDetails"]["targetId"]
-                        found[tgt_id] = {
-                            "id": tgt_id,
-                            "name": f["name"] + " (shortcut)",
-                        }
-
+                        found[tgt_id] = {"id": tgt_id, "name": f["name"] + " (shortcut)"}
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
-
     return list(found.values())
 
 
@@ -336,14 +325,13 @@ def main() -> None:
         )
         drive = build("drive", "v3", credentials=creds)
 
-        src_root = os.environ["SOURCE_FOLDER_ID"]
-        dst_parent = os.environ["DEST_FOLDER_ID"]
+        src_root = os.environ["SOURCE_FOLDER_ID"]        # only this one stays env‑driven
         today = datetime.utcnow().strftime("%d.%m.%Y")
 
-        # -------- wipe old backup if present --------
+        # ----- wipe old backup -----
         res = drive.files().list(
             q=(
-                f"'{dst_parent}' in parents and "
+                f"'{DEST_PARENT_ID}' in parents and "
                 "mimeType='application/vnd.google-apps.folder' "
                 f"and name='{today}' and trashed=false"
             ),
@@ -354,14 +342,14 @@ def main() -> None:
             log.info("Deleting existing backup folder %s …", today)
             delete_folder_recursive(drive, res["files"][0]["id"])
 
-        # -------- create new dated folder --------
+        # ----- create new dated folder -----
         backup_id = (
             drive.files()
             .create(
                 body={
                     "name": today,
                     "mimeType": "application/vnd.google-apps.folder",
-                    "parents": [dst_parent],
+                    "parents": [DEST_PARENT_ID],
                 },
                 fields="id",
                 **WRITE_FLAGS,
@@ -370,7 +358,7 @@ def main() -> None:
         )
         log.info("Created backup folder %s (id=%s)", today, backup_id)
 
-        # -------- gather target files --------
+        # ----- gather & copy -----
         files = gather_spreadsheets_and_excels(drive, src_root)
         log.info("Total spreadsheets/Excels found: %d", len(files))
 
@@ -393,7 +381,7 @@ def main() -> None:
                     )
                     skipped.append((f["name"], f["id"]))
                     continue
-                raise  # other errors still abort
+                raise
 
         log.info(
             "Backup finished: %d copied, %d skipped",
@@ -415,3 +403,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
