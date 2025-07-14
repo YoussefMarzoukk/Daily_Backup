@@ -5,18 +5,16 @@ Back up a list of Google Drive folders / spreadsheets into a dated
 sub‑folder of the destination folder.  Older backups beyond KEEP newest
 are deleted first so the service‑account’s 15 GB quota never fills up.
 
-AUTH:
-  • In GitHub Actions add a secret called KEY that contains the full
-    service‑account JSON. The workflow must export it, e.g.
+Authentication:
+    1. Recommended for GitHub Actions
+         - Store the service‑account JSON in a secret called KEY
+         - In the workflow, export KEY:
+               env:
+                 KEY: ${{ secrets.KEY }}
+    2. Or commit *once* (never push!) a credentials.json at the repo root
+       or inside the script folder.  The script will pick it up.
 
-        env:
-          KEY: ${{ secrets.KEY }}
-
-    (No local credentials.json file is required in CI.)
-  • If you run the script manually on your machine you may either
-    export KEY or drop credentials.json next to this file.
-
-RUN:
+Run:
     python weekly_backup.py
 """
 
@@ -33,13 +31,11 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 # =======================================================================
-# CONSTANTS / SETTINGS --------------------------------------------------
-SCOPES           = ["https://www.googleapis.com/auth/drive"]
-CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
-
+# SETTINGS ---------------------------------------------------------------
 DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # backup target
 KEEP           = 5                # keep this many most‑recent backups
-DATE_FMT       = "%d.%m.%Y"       # folder‑name pattern you want
+DATE_FMT       = "%d.%m.%Y"       # folder‑name pattern for each run
+SCOPES         = ["https://www.googleapis.com/auth/drive"]
 # -----------------------------------------------------------------------
 # IDs of the folders / spreadsheets to back up
 SOURCES = [
@@ -82,11 +78,37 @@ EXCEL_MIMES  = {
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
 FOLDER_MIME  = "application/vnd.google-apps.folder"
 
+READ_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+WRITE_FLAGS = dict(supportsAllDrives=True)
 
-# ---------- helpers -----------------------------------------------------
+
+# ---------- credentials helper -----------------------------------------
+def load_credentials():
+    here = Path(__file__).resolve().parent
+
+    # 1 look next to this script
+    f1 = here / "credentials.json"
+    if f1.exists():
+        return service_account.Credentials.from_service_account_file(f1, scopes=SCOPES)
+
+    # 2 look one directory up (repo root)
+    f2 = here.parent / "credentials.json"
+    if f2.exists():
+        return service_account.Credentials.from_service_account_file(f2, scopes=SCOPES)
+
+    # 3 fall back to KEY env var (GitHub secret)
+    if (key := getenv("KEY")):
+        info = json.loads(key)
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    raise RuntimeError("Service‑account credentials not found (credentials.json or KEY env var)")
+# -----------------------------------------------------------------------
+
+
+# ---------- Drive utility functions ------------------------------------
 def safe_delete(drive, file_id: str) -> None:
     try:
-        drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+        drive.files().delete(fileId=file_id, **WRITE_FLAGS).execute()
     except HttpError as e:
         if e.resp.status == 403:
             log.warning("No permission to delete %s; skipping", file_id)
@@ -95,13 +117,13 @@ def safe_delete(drive, file_id: str) -> None:
 
 
 def delete_folder_recursive(drive, folder_id: str) -> None:
-    children = drive.files().list(
-        q=f"'{folder_id}' in parents and trashed=false",
-        fields="files(id,mimeType)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        pageSize=1000,
-    ).execute().get("files", [])
+    children = (
+        drive.files()
+        .list(q=f"'{folder_id}' in parents and trashed=false",
+              fields="files(id,mimeType)", **READ_FLAGS)
+        .execute()
+        .get("files", [])
+    )
     for ch in children:
         if ch["mimeType"] == FOLDER_MIME:
             delete_folder_recursive(drive, ch["id"])
@@ -110,16 +132,13 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
     safe_delete(drive, folder_id)
 
 
-def purge_old_backups(drive) -> None:
+def purge_old_backups(drive):
     resp = drive.files().list(
         q=(
             f"'{DEST_FOLDER_ID}' in parents and mimeType='{FOLDER_MIME}' "
             "and trashed=false and 'me' in owners"
         ),
-        fields="files(id,name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True,
-        pageSize=1000,
+        fields="files(id,name)", **READ_FLAGS
     ).execute()
 
     backups = []
@@ -138,33 +157,35 @@ def purge_old_backups(drive) -> None:
 
 def gather_target_files(drive, root_folder: str) -> list[dict]:
     found, visited = {}, set()
-    queue = deque([root_folder])
-    flags = dict(
-        supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000
-    )
+    q = deque([root_folder])
 
-    while queue:
-        fid = queue.popleft()
+    while q:
+        fid = q.popleft()
         if fid in visited:
             continue
         visited.add(fid)
 
         page_token = None
         while True:
-            resp = drive.files().list(
-                q=f"'{fid}' in parents and trashed=false",
-                fields=(
-                    "nextPageToken,files(id,name,mimeType,shortcutDetails/targetId,"
-                    "shortcutDetails/targetMimeType)"
-                ),
-                pageToken=page_token,
-                **flags,
-            ).execute()
+            resp = (
+                drive.files()
+                .list(
+                    q=f"'{fid}' in parents and trashed=false",
+                    fields=(
+                        "nextPageToken,"
+                        "files(id,name,mimeType,shortcutDetails/targetId,"
+                        "shortcutDetails/targetMimeType)"
+                    ),
+                    pageToken=page_token,
+                    **READ_FLAGS,
+                )
+                .execute()
+            )
 
             for f in resp.get("files", []):
                 mt = f["mimeType"]
                 if mt == FOLDER_MIME:
-                    queue.append(f["id"])
+                    q.append(f["id"])
                 elif mt in TARGET_MIMES:
                     found[f["id"]] = f
                 elif mt == "application/vnd.google-apps.shortcut":
@@ -178,27 +199,13 @@ def gather_target_files(drive, root_folder: str) -> list[dict]:
                 break
 
     return list(found.values())
-# ------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 
 
-def get_credentials():
-    """Return google.oauth2.service_account.Credentials from env or file."""
-    key_json = getenv("KEY")
-    if key_json:
-        info = json.loads(key_json)
-        return service_account.Credentials.from_service_account_info(
-            info, scopes=SCOPES
-        )
-    if CREDENTIALS_FILE.exists():
-        return service_account.Credentials.from_service_account_file(
-            CREDENTIALS_FILE, scopes=SCOPES
-        )
-    raise RuntimeError("Service‑account credentials not found (env KEY or credentials.json)")
-
-
-def main() -> None:
+def main():
+    # ---- authenticate ---------------------------------------------------
     try:
-        creds = get_credentials()
+        creds = load_credentials()
         drive = build("drive", "v3", credentials=creds)
     except Exception:
         log.exception("Authentication failed")
@@ -206,21 +213,21 @@ def main() -> None:
 
     today = datetime.utcnow().strftime(DATE_FMT)
 
-    # -- 1. free quota -----------------------------------------------------
+    # ---- rotate old backups --------------------------------------------
     purge_old_backups(drive)
 
-    # -- 2. create today’s backup root ------------------------------------
-    backup_root = drive.files().create(
-        body={
-            "name": today,
-            "mimeType": FOLDER_MIME,
-            "parents": [DEST_FOLDER_ID],
-        },
-        fields="id",
-    ).execute()["id"]
+    # ---- create today’s backup folder ----------------------------------
+    backup_root = (
+        drive.files()
+        .create(
+            body={"name": today, "mimeType": FOLDER_MIME, "parents": [DEST_FOLDER_ID]},
+            fields="id", **WRITE_FLAGS
+        )
+        .execute()["id"]
+    )
     log.info("Created daily backup folder %s (id=%s)", today, backup_root)
 
-    # -- 3. iterate over sources ------------------------------------------
+    # ---- process every source id ---------------------------------------
     seen = set()
     for src_id in SOURCES:
         if src_id in seen:
@@ -229,23 +236,30 @@ def main() -> None:
 
         try:
             meta = drive.files().get(
-                fileId=src_id,
-                fields="id,name,mimeType",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
+                fileId=src_id, fields="id,name,mimeType", **READ_FLAGS
             ).execute()
         except HttpError as e:
-            log.warning("Cannot access %s — %s", src_id, e)
+            log.warning("Cannot access %s – %s", src_id, e)
             continue
 
         name, mt = meta["name"], meta["mimeType"]
 
+        # --- folder ------------------------------------------------------
         if mt == FOLDER_MIME:
             log.info("Scanning folder %s …", name)
-            dst_folder = drive.files().create(
-                body={"name": name, "mimeType": FOLDER_MIME, "parents": [backup_root]},
-                fields="id",
-            ).execute()["id"]
+            dst_folder = (
+                drive.files()
+                .create(
+                    body={
+                        "name": name,
+                        "mimeType": FOLDER_MIME,
+                        "parents": [backup_root],
+                    },
+                    fields="id",
+                    **WRITE_FLAGS,
+                )
+                .execute()["id"]
+            )
 
             files = gather_target_files(drive, src_id)
             log.info("  %d spreadsheet/Excel files found", len(files))
@@ -255,22 +269,23 @@ def main() -> None:
                     drive.files().copy(
                         fileId=f["id"],
                         body={"name": f["name"], "parents": [dst_folder]},
-                        supportsAllDrives=True,
+                        **WRITE_FLAGS,
                     ).execute()
                     log.info("  Copied %s", f["name"])
                 except HttpError as e:
-                    log.warning("  Skip %s — %s", f["name"], e)
+                    log.warning("  Skip %s – %s", f["name"], e)
 
+        # --- single spreadsheet / Excel ---------------------------------
         elif mt in TARGET_MIMES:
             try:
                 drive.files().copy(
                     fileId=src_id,
                     body={"name": name, "parents": [backup_root]},
-                    supportsAllDrives=True,
+                    **WRITE_FLAGS,
                 ).execute()
                 log.info("Copied %s", name)
             except HttpError as e:
-                log.warning("Skip %s — %s", name, e)
+                log.warning("Skip %s – %s", name, e)
 
         else:
             log.info("Skipping %s (unsupported mimeType %s)", name, mt)
