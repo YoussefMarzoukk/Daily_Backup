@@ -5,14 +5,10 @@ Back up a list of Google Drive folders / spreadsheets into a dated
 sub‑folder of the destination folder.  Older backups beyond KEEP newest
 are deleted first so the service‑account’s 15 GB quota never fills up.
 
-Authentication:
-    1. Recommended for GitHub Actions
-         - Store the service‑account JSON in a secret called KEY
-         - In the workflow, export KEY:
-               env:
-                 KEY: ${{ secrets.KEY }}
-    2. Or commit *once* (never push!) a credentials.json at the repo root
-       or inside the script folder.  The script will pick it up.
+Auth order:
+    1. credentials.json next to this script
+    2. credentials.json one directory up
+    3. KEY environment variable (GitHub secret)
 
 Run:
     python weekly_backup.py
@@ -78,29 +74,21 @@ EXCEL_MIMES  = {
 TARGET_MIMES = {GOOGLE_SHEET, *EXCEL_MIMES}
 FOLDER_MIME  = "application/vnd.google-apps.folder"
 
-READ_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+# ---- Drive call flag sets ---------------------------------------------
+LIST_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+GET_FLAGS   = dict(supportsAllDrives=True)
 WRITE_FLAGS = dict(supportsAllDrives=True)
+# -----------------------------------------------------------------------
 
 
 # ---------- credentials helper -----------------------------------------
 def load_credentials():
     here = Path(__file__).resolve().parent
-
-    # 1 look next to this script
-    f1 = here / "credentials.json"
-    if f1.exists():
-        return service_account.Credentials.from_service_account_file(f1, scopes=SCOPES)
-
-    # 2 look one directory up (repo root)
-    f2 = here.parent / "credentials.json"
-    if f2.exists():
-        return service_account.Credentials.from_service_account_file(f2, scopes=SCOPES)
-
-    # 3 fall back to KEY env var (GitHub secret)
+    for p in (here / "credentials.json", here.parent / "credentials.json"):
+        if p.exists():
+            return service_account.Credentials.from_service_account_file(p, scopes=SCOPES)
     if (key := getenv("KEY")):
-        info = json.loads(key)
-        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
+        return service_account.Credentials.from_service_account_info(json.loads(key), scopes=SCOPES)
     raise RuntimeError("Service‑account credentials not found (credentials.json or KEY env var)")
 # -----------------------------------------------------------------------
 
@@ -120,7 +108,7 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
     children = (
         drive.files()
         .list(q=f"'{folder_id}' in parents and trashed=false",
-              fields="files(id,mimeType)", **READ_FLAGS)
+              fields="files(id,mimeType)", **LIST_FLAGS)
         .execute()
         .get("files", [])
     )
@@ -138,7 +126,7 @@ def purge_old_backups(drive):
             f"'{DEST_FOLDER_ID}' in parents and mimeType='{FOLDER_MIME}' "
             "and trashed=false and 'me' in owners"
         ),
-        fields="files(id,name)", **READ_FLAGS
+        fields="files(id,name)", **LIST_FLAGS
     ).execute()
 
     backups = []
@@ -177,7 +165,7 @@ def gather_target_files(drive, root_folder: str) -> list[dict]:
                         "shortcutDetails/targetMimeType)"
                     ),
                     pageToken=page_token,
-                    **READ_FLAGS,
+                    **LIST_FLAGS,
                 )
                 .execute()
             )
@@ -235,9 +223,7 @@ def main():
         seen.add(src_id)
 
         try:
-            meta = drive.files().get(
-                fileId=src_id, fields="id,name,mimeType", **READ_FLAGS
-            ).execute()
+            meta = drive.files().get(fileId=src_id, fields="id,name,mimeType", **GET_FLAGS).execute()
         except HttpError as e:
             log.warning("Cannot access %s – %s", src_id, e)
             continue
@@ -249,15 +235,8 @@ def main():
             log.info("Scanning folder %s …", name)
             dst_folder = (
                 drive.files()
-                .create(
-                    body={
-                        "name": name,
-                        "mimeType": FOLDER_MIME,
-                        "parents": [backup_root],
-                    },
-                    fields="id",
-                    **WRITE_FLAGS,
-                )
+                .create(body={"name": name, "mimeType": FOLDER_MIME, "parents": [backup_root]},
+                        fields="id", **WRITE_FLAGS)
                 .execute()["id"]
             )
 
