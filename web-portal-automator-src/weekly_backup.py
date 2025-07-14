@@ -2,7 +2,7 @@
 """
 Weekly Drive backup.
 
-Copies the contents of each ID in SOURCE_FOLDER_IDS into a dated sub‑folder
+Copies every file/folder in SOURCE_FOLDER_IDS into a dated sub‑folder
 (DD.MM.YYYY) under DEST_PARENT_ID.
 
 Environment variables
@@ -14,7 +14,6 @@ Environment variables
 from __future__ import annotations
 import os, json, sys
 from datetime import datetime
-from collections import deque
 from typing import List, Dict
 
 from google.oauth2 import service_account
@@ -34,6 +33,7 @@ SOURCE_FOLDER_IDS = [
 creds_json = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON")
 if not creds_json:
     sys.exit("❌  GDRIVE_SERVICE_ACCOUNT_JSON secret not set")
+
 creds = service_account.Credentials.from_service_account_info(
     json.loads(creds_json),
     scopes=["https://www.googleapis.com/auth/drive"],
@@ -75,7 +75,7 @@ def find_existing(parent_id: str, name: str, mime: str) -> str | None:
         f"'{parent_id}' in parents and name='{safe_name}' "
         f"and mimeType='{mime}' and trashed=false"
     )
-    resp = drive.files().list(q=q, fields="files(id)", pageSize=1, **READ_FLAGS).execute()
+    resp = drive.files().list(q=q, fields="files(id)", **READ_FLAGS).execute()
     items = resp.get("files", [])
     return items[0]["id"] if items else None
 
@@ -110,7 +110,6 @@ def main():
     dest_root = os.getenv("WEEKLY_DEST_FOLDER", DEST_PARENT_ID)
     today     = datetime.utcnow().strftime("%d.%m.%Y")
 
-    # Optionally wipe previous snapshot
     dated_folder_id = find_existing(dest_root, today, "application/vnd.google-apps.folder")
     if dated_folder_id and os.getenv("CLEAN_DEST") == "1":
         print(f"🗑  Removing existing '{today}' tree …")
@@ -121,7 +120,6 @@ def main():
         dated_folder_id = ensure_folder(dest_root, today)
         print(f"📂  Created destination folder '{today}' (id={dated_folder_id})")
 
-    # Copy each source folder
     for src in SOURCE_FOLDER_IDS:
         try:
             recurse_copy(src, dated_folder_id)
