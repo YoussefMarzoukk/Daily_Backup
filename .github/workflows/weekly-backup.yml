@@ -39,4 +39,4 @@ jobs:
     - name: Run weekly backup
       env:
         GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.Key }}
-      run: python weekly_backup.py
+      run: python web-portal-automator-src/weekly_backup.py
