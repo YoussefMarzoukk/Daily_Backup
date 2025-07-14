@@ -1,37 +1,46 @@
-# .github/workflows/main.yml
 
 name: Daily Google Drive Backup
 
 on:
-  # Allows you to click “Run workflow” in the Actions UI immediately
-  workflow_dispatch:
-  # And also runs at midnight UTC every day
+  workflow_dispatch:                # manual “Run workflow” button
   schedule:
-    - cron: '0 18 * * *' 
+    - cron: '0 18 * * *'            # every day 18 UTC  (= midnight UTC+6)
 
 jobs:
   backup:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out your repo
-        uses: actions/checkout@v3
+    # ───────────────────────── source code ─────────────────────────
+    - name: Check out repository
+      uses: actions/checkout@v3
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+    # ─────────────────── Python environment ───────────────────────
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
 
-      - name: Upgrade pip & install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r web-portal-automator-src/requirements.txt
+    # ─────────────── write credentials.json from secret ───────────
+    # Secret name exactly “Key”; change if you used a different name.
+    - name: Create service‑account key
+      env:
+        SA_JSON: ${{ secrets.Key }}
+      run: |
+        mkdir -p web-portal-automator-src
+        echo "$SA_JSON" > web-portal-automator-src/credentials.json
+        chmod 600 web-portal-automator-src/credentials.json
 
-      - name: Run Drive backup
-        # run from inside your src folder so main.py sees credentials.json
-        working-directory: web-portal-automator-src
-        env:
-          SOURCE_FOLDER_ID: '1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi'
-          DEST_FOLDER_ID:   '10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v'
-        run: |
-          python main.py
+    # ───────────────────── dependencies ───────────────────────────
+    - name: Upgrade pip & install requirements
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r web-portal-automator-src/requirements.txt
+
+    # ───────────────────── run the backup script ─────────────────
+    - name: Run Drive backup
+      working-directory: web-portal-automator-src   # credentials.json is here
+      env:
+        SOURCE_FOLDER_ID: '1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi'
+        DEST_FOLDER_ID:   '10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v'
+      run: python main.py
