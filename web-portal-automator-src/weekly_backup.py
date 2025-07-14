@@ -1,150 +1,133 @@
 #!/usr/bin/env python3
 """
-Backup selected Google‑Drive folders into a destination folder.
+Weekly Drive backup.
 
-Prerequisites
--------------
-pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
+Copies the contents of each ID in SOURCE_FOLDER_IDS into a dated sub‑folder
+(DD.MM.YYYY) under DEST_PARENT_ID.
 
-GitHub secret
--------------
-Save your entire service‑account JSON *as a single secret string*:
-
-    name:  GDRIVE_SERVICE_ACCOUNT_JSON
-    value: { "type": "service_account", ... }
-
-Workflow example (runs daily at 02:00 UTC)
-------------------------------------------
-name: Drive‑Backup
-on:
-  schedule: [{cron: '0 2 * * *'}]
-  workflow_dispatch:
-jobs:
-  backup:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - name: Install deps
-      run: pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
-    - name: Run backup
-      env:
-        GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-      run: python backup_drive_folders.py
+Environment variables
+---------------------
+• GDRIVE_SERVICE_ACCOUNT_JSON : entire service‑account key (JSON string)
+• WEEKLY_DEST_FOLDER          : override DEST_PARENT_ID (optional)
+• CLEAN_DEST                  : "1" → delete dated folder before copy (optional)
 """
-import os
-import io
-import json
-import pathlib
+from __future__ import annotations
+import os, json, sys
+from datetime import datetime
+from collections import deque
 from typing import List, Dict
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
-# ------------------------------------------------------------------------
-# ✏️  Edit these
-DESTINATION_FOLDER_ID = "1aoSe5seTsCGSn_2gDjU3SiFxlTwAFMmw"
+# ──────────────────────────────────────────────────────────────────────────────
+DEST_PARENT_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"  # backup root (shared‑drive)
 SOURCE_FOLDER_IDS = [
     "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb",
     "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
-    # Add more folder IDs here …
+    # add more …
 ]
-# ------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-CREDS_JSON = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON")
-if not CREDS_JSON:
-    raise SystemExit("❌  GDRIVE_SERVICE_ACCOUNT_JSON secret is not set")
-
+# ---------- authentication ----------
+creds_json = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON")
+if not creds_json:
+    sys.exit("❌  GDRIVE_SERVICE_ACCOUNT_JSON secret not set")
 creds = service_account.Credentials.from_service_account_info(
-    json.loads(CREDS_JSON), scopes=SCOPES
+    json.loads(creds_json),
+    scopes=["https://www.googleapis.com/auth/drive"],
 )
 drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
+# ---------- Drive call presets ----------
+READ_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
+WRITE_FLAGS = dict(supportsAllDrives=True)
 
+# ---------- helpers ----------
 def list_children(folder_id: str) -> List[Dict]:
-    """Return metadata for immediate children of a folder."""
-    q = f"'{folder_id}' in parents and trashed = false"
-    children = []
-    page_token = None
+    """Immediate (non‑trashed) children of a folder."""
+    q = f"'{folder_id}' in parents and trashed=false"
+    out, token = [], None
     while True:
         resp = (
             drive.files()
-            .list(q=q, fields="nextPageToken, files(id, name, mimeType)", pageToken=page_token)
+            .list(q=q, fields="nextPageToken,files(id,name,mimeType)", pageToken=token, **READ_FLAGS)
             .execute()
         )
-        children.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return children
+        out.extend(resp.get("files", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            return out
 
+def delete_tree(file_id: str):
+    """Delete file/folder recursively."""
+    meta = drive.files().get(fileId=file_id, fields="id,mimeType", **READ_FLAGS).execute()
+    if meta["mimeType"] == "application/vnd.google-apps.folder":
+        for ch in list_children(file_id):
+            delete_tree(ch["id"])
+    drive.files().delete(fileId=file_id, **WRITE_FLAGS).execute()
 
-def find_existing(dest_parent: str, name: str, mime: str) -> str | None:
-    """Return ID of a file/folder with same name & mimeType in destination, or None."""
+def find_existing(parent_id: str, name: str, mime: str) -> str | None:
+    """Return ID of an item with same name & type under parent, else None."""
+    safe_name = name.replace("'", r"\'")
     q = (
-        f"'{dest_parent}' in parents and "
-        f"name = '{name.replace(\"'\", \"\\'\")}' and "
-        f"mimeType = '{mime}' and trashed = false"
+        f"'{parent_id}' in parents and name='{safe_name}' "
+        f"and mimeType='{mime}' and trashed=false"
     )
-    resp = drive.files().list(q=q, fields="files(id)", pageSize=1).execute()
-    files = resp.get("files", [])
-    return files[0]["id"] if files else None
+    resp = drive.files().list(q=q, fields="files(id)", pageSize=1, **READ_FLAGS).execute()
+    items = resp.get("files", [])
+    return items[0]["id"] if items else None
 
+def ensure_folder(parent_id: str, name: str) -> str:
+    """Create (or return existing) folder with given name under parent."""
+    mime_folder = "application/vnd.google-apps.folder"
+    existing = find_existing(parent_id, name, mime_folder)
+    if existing:
+        return existing
+    body = {"name": name, "parents": [parent_id], "mimeType": mime_folder}
+    return drive.files().create(body=body, fields="id", **WRITE_FLAGS).execute()["id"]
 
-def copy_file(file_id: str, dest_parent: str, name: str) -> str:
-    """Copy regular file into destination and return new file ID."""
-    body = {"name": name, "parents": [dest_parent]}
-    new_file = drive.files().copy(fileId=file_id, body=body).execute()
-    return new_file["id"]
-
-
-def copy_gsheet(file_id: str, dest_parent: str, name: str) -> str:
-    """Duplicate a Google Sheet (needs `files.copy` as well)."""
-    return copy_file(file_id, dest_parent, name)
-
-
-def ensure_folder(dest_parent: str, name: str) -> str:
-    """Create (or return existing) sub‑folder under dest_parent."""
-    existing_id = find_existing(dest_parent, name, "application/vnd.google-apps.folder")
-    if existing_id:
-        return existing_id
-    meta = {
-        "name": name,
-        "parents": [dest_parent],
-        "mimeType": "application/vnd.google-apps.folder",
-    }
-    new_folder = drive.files().create(body=meta, fields="id").execute()
-    return new_folder["id"]
-
+def copy_regular(file_id: str, parent_id: str, name: str):
+    body = {"name": name, "parents": [parent_id]}
+    drive.files().copy(fileId=file_id, body=body, fields="id", **WRITE_FLAGS).execute()
 
 def recurse_copy(src_id: str, dest_parent: str):
-    """Recursively copy src_id into dest_parent."""
-    src_meta = drive.files().get(fileId=src_id, fields="id, name, mimeType").execute()
-    name = src_meta["name"]
-    mime = src_meta["mimeType"]
+    """Recursively copy src tree into dest_parent (skip duplicates)."""
+    meta = drive.files().get(fileId=src_id, fields="id,name,mimeType", **READ_FLAGS).execute()
+    name, mime = meta["name"], meta["mimeType"]
 
     if mime == "application/vnd.google-apps.folder":
-        dest_folder_id = ensure_folder(dest_parent, name)
+        dest_id = ensure_folder(dest_parent, name)
         for child in list_children(src_id):
-            recurse_copy(child["id"], dest_folder_id)
-    elif mime == "application/vnd.google-apps.spreadsheet":
-        if not find_existing(dest_parent, name, mime):
-            copy_gsheet(src_id, dest_parent, name)
+            recurse_copy(child["id"], dest_id)
     else:
         if not find_existing(dest_parent, name, mime):
-            copy_file(src_id, dest_parent, name)
+            copy_regular(src_id, dest_parent, name)
 
-
+# ---------- main ----------
 def main():
-    for src in SOURCE_FOLDER_IDS:
-        recurse_copy(src, DESTINATION_FOLDER_ID)
-    print("✅  Backup complete.")
+    dest_root = os.getenv("WEEKLY_DEST_FOLDER", DEST_PARENT_ID)
+    today     = datetime.utcnow().strftime("%d.%m.%Y")
 
+    # Optionally wipe previous snapshot
+    dated_folder_id = find_existing(dest_root, today, "application/vnd.google-apps.folder")
+    if dated_folder_id and os.getenv("CLEAN_DEST") == "1":
+        print(f"🗑  Removing existing '{today}' tree …")
+        delete_tree(dated_folder_id)
+        dated_folder_id = None
+
+    if not dated_folder_id:
+        dated_folder_id = ensure_folder(dest_root, today)
+        print(f"📂  Created destination folder '{today}' (id={dated_folder_id})")
+
+    # Copy each source folder
+    for src in SOURCE_FOLDER_IDS:
+        try:
+            recurse_copy(src, dated_folder_id)
+        except HttpError as e:
+            print(f"⚠️   Skipped {src} — {e}")
+    print("✅  Weekly Drive backup complete.")
 
 if __name__ == "__main__":
     main()
