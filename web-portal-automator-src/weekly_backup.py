@@ -1,19 +1,32 @@
 """
 weekly_backup.py
 ────────────────
-Back up a fixed list of Google Drive folders / spreadsheets into a dated
+Back up a list of Google Drive folders / spreadsheets into a dated
 sub‑folder of the destination folder.  Older backups beyond KEEP newest
 are deleted first so the service‑account’s 15 GB quota never fills up.
 
-• Put service‑account JSON next to this file and name it credentials.json
-• Run:  python weekly_backup.py
+AUTH:
+  • In GitHub Actions add a secret called KEY that contains the full
+    service‑account JSON. The workflow must export it, e.g.
+
+        env:
+          KEY: ${{ secrets.KEY }}
+
+    (No local credentials.json file is required in CI.)
+  • If you run the script manually on your machine you may either
+    export KEY or drop credentials.json next to this file.
+
+RUN:
+    python weekly_backup.py
 """
 
+import json
 import logging
 import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from os import getenv
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -24,7 +37,7 @@ from googleapiclient.errors import HttpError
 SCOPES           = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path(__file__).with_name("credentials.json")
 
-DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # <<< target folder
+DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # backup target
 KEEP           = 5                # keep this many most‑recent backups
 DATE_FMT       = "%d.%m.%Y"       # folder‑name pattern you want
 # -----------------------------------------------------------------------
@@ -82,7 +95,6 @@ def safe_delete(drive, file_id: str) -> None:
 
 
 def delete_folder_recursive(drive, folder_id: str) -> None:
-    """Best‑effort permanent delete of a folder tree owned by the SA."""
     children = drive.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         fields="files(id,mimeType)",
@@ -99,7 +111,6 @@ def delete_folder_recursive(drive, folder_id: str) -> None:
 
 
 def purge_old_backups(drive) -> None:
-    """Delete dated backup folders beyond KEEP newest."""
     resp = drive.files().list(
         q=(
             f"'{DEST_FOLDER_ID}' in parents and mimeType='{FOLDER_MIME}' "
@@ -126,7 +137,6 @@ def purge_old_backups(drive) -> None:
 
 
 def gather_target_files(drive, root_folder: str) -> list[dict]:
-    """Return every Google Sheet or Excel under root_folder (recursive)."""
     found, visited = {}, set()
     queue = deque([root_folder])
     flags = dict(
@@ -171,11 +181,24 @@ def gather_target_files(drive, root_folder: str) -> list[dict]:
 # ------------------------------------------------------------------------
 
 
-def main() -> None:
-    try:
-        creds = service_account.Credentials.from_service_account_file(
+def get_credentials():
+    """Return google.oauth2.service_account.Credentials from env or file."""
+    key_json = getenv("KEY")
+    if key_json:
+        info = json.loads(key_json)
+        return service_account.Credentials.from_service_account_info(
+            info, scopes=SCOPES
+        )
+    if CREDENTIALS_FILE.exists():
+        return service_account.Credentials.from_service_account_file(
             CREDENTIALS_FILE, scopes=SCOPES
         )
+    raise RuntimeError("Service‑account credentials not found (env KEY or credentials.json)")
+
+
+def main() -> None:
+    try:
+        creds = get_credentials()
         drive = build("drive", "v3", credentials=creds)
     except Exception:
         log.exception("Authentication failed")
@@ -198,7 +221,7 @@ def main() -> None:
     log.info("Created daily backup folder %s (id=%s)", today, backup_root)
 
     # -- 3. iterate over sources ------------------------------------------
-    seen = set()  # handle accidental duplicates
+    seen = set()
     for src_id in SOURCES:
         if src_id in seen:
             continue
