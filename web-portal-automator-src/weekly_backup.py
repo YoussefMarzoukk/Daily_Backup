@@ -1,24 +1,19 @@
 """
-weekly_backup.py
-────────────────
-Full‑tree Google Drive backup with:
+weekly_backup.py – resilient Google Drive backup
 
-■  Recursion – every folder source is cloned 1‑for‑1 (all sub‑folders,
-   every file type).  
-■  Duplicate guard – copies only the first file whose *canonical* name
-   (ignores “Copy of …”, “Copia de …”, “(1)” etc.) appears in each folder.  
-■  Automatic exponential back‑off on every Drive API request
-   (handles 403 userRateLimitExceeded / rateLimitExceeded, 429, 5xx).  
-■  Rotation – keeps the newest KEEP dated backups in DEST_FOLDER_ID.  
-■  Auth – credentials.json (script dir → repo root) → KEY env var
-   (GitHub Secret containing the raw service‑account JSON).
+• Recursively clones each folder source (all file types) into a dated
+  sub‑folder; preserves sub‑folder structure.
+• Keeps only the newest KEEP backups.
+• Skips duplicate files in each folder (canonical name comparison).
+• Retries Drive API calls AND transient transport errors
+  (403 userRateLimitExceeded, 429, 5xx, SSL, token refresh, etc.).
 
 Run:
     python weekly_backup.py
 """
 
 from __future__ import annotations
-import json, logging, random, re, sys, time
+import json, logging, random, re, sys, time, ssl, socket
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -27,18 +22,20 @@ from os import getenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from google.auth.exceptions import RefreshError
 
 # ─────────── SETTINGS ───────────
-DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # backup root
-KEEP           = 5                                     # retain N newest
-DATE_FMT       = "%d.%m.%Y"                            # folder name
+DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"
+KEEP           = 5
+DATE_FMT       = "%d.%m.%Y"
 SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
-# sources: folders first, then single spreadsheets
 SOURCES = [
+    # folders
     "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb", "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
     "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB", "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
     "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP", "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
+    # single spreadsheets
     "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M", "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
     "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4", "1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s",
     "1cE-eC__yz6bz931D3DyFj-ZyzJGIx-Ta", "1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8",
@@ -55,37 +52,44 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Drive flags
 FOLDER_MIME = "application/vnd.google-apps.folder"
 LIST_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
 WRITE_FLAGS = dict(supportsAllDrives=True)
 GET_FLAGS   = dict(supportsAllDrives=True)
 
 # ---------- API back‑off wrapper ----------
+TRANSIENT_EXC = (
+    HttpError, RefreshError,
+    ssl.SSLError, socket.timeout, ConnectionResetError,
+    ConnectionAbortedError, BrokenPipeError, OSError,
+)
+
 def gapi_execute(req, *, max_tries: int = 7):
-    """Execute a googleapiclient request with automatic back‑off."""
     delay = 2
     for attempt in range(1, max_tries + 1):
         try:
             return req.execute()
-        except HttpError as e:
-            status = e.resp.status
-            content = e.content.decode() if isinstance(e.content, bytes) else str(e)
-            retriable = (
-                status in (429, 500, 502, 503, 504) or
-                (status == 403 and
-                 ("userRateLimitExceeded" in content or "rateLimitExceeded" in content))
-            )
-            if not retriable or attempt == max_tries:
+        except TRANSIENT_EXC as e:
+            # decide if HttpError is retriable
+            if isinstance(e, HttpError):
+                st = e.resp.status
+                body = e.content.decode() if isinstance(e.content, bytes) else str(e)
+                retriable = (
+                    st in (429, 500, 502, 503, 504) or
+                    (st == 403 and ("userRateLimitExceeded" in body or "rateLimitExceeded" in body))
+                )
+                if not retriable:
+                    raise
+            if attempt == max_tries:
                 raise
             sleep_for = delay + random.uniform(0, 1)
-            log.warning("Rate‑limited (HTTP %d, attempt %d/%d). Sleeping %.1fs …",
-                        status, attempt, max_tries, sleep_for)
+            log.warning("Transient error (%s, attempt %d/%d). Sleeping %.1fs …",
+                        type(e).__name__, attempt, max_tries, sleep_for)
             time.sleep(sleep_for)
             delay *= 2
 # ------------------------------------------
 
-# canonical‑name helper (for duplicate detection)
+# canonical‑name helper
 canon_rx = re.compile(r"^(?:(?:Copy of |Copia de )+)?(.+?)(?: \(\d+\))?(\.[^.]+)?$",
                       re.IGNORECASE)
 def canonical(name: str) -> str:
@@ -100,7 +104,7 @@ def load_credentials():
             return service_account.Credentials.from_service_account_file(p, scopes=SCOPES)
     if (raw := getenv("KEY")):
         return service_account.Credentials.from_service_account_info(json.loads(raw), scopes=SCOPES)
-    raise RuntimeError("Service‑account credentials not found (credentials.json or KEY env var)")
+    raise RuntimeError("Service‑account credentials not found")
 # ---------------------------------
 
 # ---------- housekeeping ----------
@@ -111,7 +115,7 @@ def rotate_backups(drive):
         fields="files(id,name)", **LIST_FLAGS))
     dated = []
     for f in resp["files"]:
-        try:  # keep only folders named like a date
+        try:
             datetime.strptime(f["name"], DATE_FMT)
             dated.append(f)
         except ValueError:
@@ -124,10 +128,10 @@ def rotate_backups(drive):
 
 # ---------- recursive cloning ----------
 def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
-    """Clone src folder tree into dst_parent. Returns (copied, duplicates)."""
-    src_meta = gapi_execute(drive.files().get(fileId=src_id, fields="name", **GET_FLAGS))
+    src_name = gapi_execute(drive.files().get(
+        fileId=src_id, fields="name", **GET_FLAGS))["name"]
     dst_id = gapi_execute(drive.files().create(
-        body={"name": src_meta["name"], "mimeType": FOLDER_MIME, "parents": [dst_parent]},
+        body={"name": src_name, "mimeType": FOLDER_MIME, "parents": [dst_parent]},
         fields="id", **WRITE_FLAGS))["id"]
 
     copied = dup = 0
@@ -142,8 +146,7 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
         for f in resp["files"]:
             if f["mimeType"] == FOLDER_MIME:
                 c, d = clone_folder(drive, f["id"], dst_id)
-                copied += c
-                dup += d
+                copied += c; dup += d
             else:
                 cn = canonical(f["name"])
                 if cn in dup_guard:
@@ -176,8 +179,7 @@ def main():
         fields="id", **WRITE_FLAGS))["id"]
     log.info("Created backup folder %s (id=%s)", today, backup_root)
 
-    # de‑duplicate the SOURCES list itself
-    for sid in dict.fromkeys(SOURCES):
+    for sid in dict.fromkeys(SOURCES):  # remove duplicates in list itself
         try:
             meta = gapi_execute(drive.files().get(
                 fileId=sid, fields="id,name,mimeType", **GET_FLAGS))
@@ -187,19 +189,17 @@ def main():
 
         name, mt = meta["name"], meta["mimeType"]
 
-        # ----- folder source -----
         if mt == FOLDER_MIME:
             log.info("Cloning folder %s …", name)
-            copied, dup = clone_folder(drive, sid, backup_root)
-            log.info("Folder %-25s → %5d copied, %4d duplicates skipped",
-                     name, copied, dup)
+            c, d = clone_folder(drive, sid, backup_root)
+            log.info("Folder %-25s → %5d copied, %4d duplicates skipped", name, c, d)
 
-        # ----- single file source -----
         else:
-            already = gapi_execute(drive.files().list(
+            # single file
+            existing = gapi_execute(drive.files().list(
                 q=f"'{backup_root}' in parents and name='{name}' and trashed=false",
                 fields="files(id)", **LIST_FLAGS))["files"]
-            if already:
+            if existing:
                 log.info("File   %-25s → already exists, skipped", name)
                 continue
             gapi_execute(drive.files().copy(
