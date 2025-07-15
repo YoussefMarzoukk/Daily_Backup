@@ -1,15 +1,8 @@
 """
-weekly_backup.py – resilient Google Drive backup
-
-• Recursively clones each folder source (all file types) into a dated
-  sub‑folder; preserves sub‑folder structure.
-• Keeps only the newest KEEP backups.
-• Skips duplicate files in each folder (canonical name comparison).
-• Retries Drive API calls AND transient transport errors
-  (403 userRateLimitExceeded, 429, 5xx, SSL, token refresh, etc.).
-
-Run:
-    python weekly_backup.py
+weekly_backup.py – full‑tree Drive backup with:
+• Resume folder processed last
+• Heart‑beat progress log every LOG_EVERY files
+• Duplicate guard + exponential back‑off + transient‑error retry
 """
 
 from __future__ import annotations
@@ -24,17 +17,20 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
 
-# ─────────── SETTINGS ───────────
+# ───────── CONFIG ─────────
 DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"
 KEEP           = 5
 DATE_FMT       = "%d.%m.%Y"
 SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
+RESUME_ID      = "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP"      # process last
+LOG_EVERY      = 100                                      # heartbeat freq
+
 SOURCES = [
-    # folders
+    # folders (except Resume, which is appended later)
     "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb", "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
     "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB", "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
-    "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP", "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
+    "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
     # single spreadsheets
     "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M", "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
     "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4", "1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s",
@@ -43,7 +39,8 @@ SOURCES = [
     "1aEkju3lf6MfeXIcbiq3Gu6T1KCkFnVLyRrOwS8iLvTM", "1XFo-LxfkFXg9EUipvVAys0vIJ2xjdlTsx7MwVjeyQHY",
     "1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc",
 ]
-# ────────────────────────────────
+SOURCES.append(RESUME_ID)        # ensure Resume is last
+# ──────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +67,6 @@ def gapi_execute(req, *, max_tries: int = 7):
         try:
             return req.execute()
         except TRANSIENT_EXC as e:
-            # decide if HttpError is retriable
             if isinstance(e, HttpError):
                 st = e.resp.status
                 body = e.content.decode() if isinstance(e.content, bytes) else str(e)
@@ -90,8 +86,7 @@ def gapi_execute(req, *, max_tries: int = 7):
 # ------------------------------------------
 
 # canonical‑name helper
-canon_rx = re.compile(r"^(?:(?:Copy of |Copia de )+)?(.+?)(?: \(\d+\))?(\.[^.]+)?$",
-                      re.IGNORECASE)
+canon_rx = re.compile(r"^(?:(?:Copy of |Copia de )+)?(.+?)(?: \(\d+\))?(\.[^.]+)?$", re.I)
 def canonical(name: str) -> str:
     stem, ext = canon_rx.match(name).groups()
     return f"{stem.strip().lower()}{ext or ''}"
@@ -126,7 +121,7 @@ def rotate_backups(drive):
         log.info("Deleted old backup %s", f["name"])
 # ----------------------------------
 
-# ---------- recursive cloning ----------
+# ---------- recursive cloning with heartbeat ----------
 def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
     src_name = gapi_execute(drive.files().get(
         fileId=src_id, fields="name", **GET_FLAGS))["name"]
@@ -134,7 +129,7 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
         body={"name": src_name, "mimeType": FOLDER_MIME, "parents": [dst_parent]},
         fields="id", **WRITE_FLAGS))["id"]
 
-    copied = dup = 0
+    copied = dup = processed = 0
     dup_guard: set[str] = set()
 
     page = None
@@ -144,6 +139,7 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
             fields="nextPageToken,files(id,name,mimeType)",
             pageToken=page, **LIST_FLAGS))
         for f in resp["files"]:
+            processed += 1
             if f["mimeType"] == FOLDER_MIME:
                 c, d = clone_folder(drive, f["id"], dst_id)
                 copied += c; dup += d
@@ -151,16 +147,18 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
                 cn = canonical(f["name"])
                 if cn in dup_guard:
                     dup += 1
-                    continue
-                dup_guard.add(cn)
-                try:
-                    gapi_execute(drive.files().copy(
-                        fileId=f["id"],
-                        body={"name": f["name"], "parents": [dst_id]},
-                        **WRITE_FLAGS))
-                    copied += 1
-                except HttpError as e:
-                    log.warning("    Skip %s – %s", f["name"], e)
+                else:
+                    dup_guard.add(cn)
+                    try:
+                        gapi_execute(drive.files().copy(
+                            fileId=f["id"],
+                            body={"name": f["name"], "parents": [dst_id]},
+                            **WRITE_FLAGS))
+                        copied += 1
+                    except HttpError as e:
+                        log.warning("    Skip %s – %s", f["name"], e)
+            if processed % LOG_EVERY == 0:
+                log.info("    …%s: %d files processed so far", src_name, processed)
         page = resp.get("nextPageToken")
         if not page:
             break
@@ -179,7 +177,7 @@ def main():
         fields="id", **WRITE_FLAGS))["id"]
     log.info("Created backup folder %s (id=%s)", today, backup_root)
 
-    for sid in dict.fromkeys(SOURCES):  # remove duplicates in list itself
+    for sid in dict.fromkeys(SOURCES):  # order preserved; duplicates removed
         try:
             meta = gapi_execute(drive.files().get(
                 fileId=sid, fields="id,name,mimeType", **GET_FLAGS))
@@ -195,7 +193,6 @@ def main():
             log.info("Folder %-25s → %5d copied, %4d duplicates skipped", name, c, d)
 
         else:
-            # single file
             existing = gapi_execute(drive.files().list(
                 q=f"'{backup_root}' in parents and name='{name}' and trashed=false",
                 fields="files(id)", **LIST_FLAGS))["files"]
