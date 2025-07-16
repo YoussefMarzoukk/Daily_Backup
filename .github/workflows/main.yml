@@ -42,5 +42,5 @@ jobs:
       working-directory: web-portal-automator-src   # credentials.json is here
       env:
         SOURCE_FOLDER_ID: '1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi'
-        DEST_FOLDER_ID:   '1OAfkw26yhJ_bY4cX2ggFvFZ4exrrONnd'
+        DEST_FOLDER_ID:   '0APme9gVU57uhUk9PVA'
       run: python main.py
