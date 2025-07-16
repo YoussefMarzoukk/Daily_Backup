@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      WEEKLY_DEST_FOLDER: "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"  # ← backup root
+      WEEKLY_DEST_FOLDER: "14EmdS7r31S4zjf9Z-FRY4gv6SzCVU1BG"  # ← backup root
       CLEAN_DEST: "0"                                         # "1" purges if exists
 
     steps:
