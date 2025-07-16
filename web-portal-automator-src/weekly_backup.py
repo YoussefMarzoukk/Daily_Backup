@@ -1,11 +1,28 @@
 """
-weekly_backup.py – full‑tree Drive backup with:
-• Resume folder processed last
-• Heart‑beat progress log every LOG_EVERY files
-• Duplicate guard + exponential back‑off + transient‑error retry
+weekly_backup.py
+────────────────
+Full‑tree Google Drive backup with:
+
+• Recursively clones each folder source (all file types) into a dated
+  sub‑folder; preserves sub‑folder structure.
+• Duplicate guard – only the first file with any given canonical name
+  (ignores “Copy of …”, “Copia de …”, “(1)” etc.) is copied in each folder.
+• Heart‑beat log every LOG_EVERY processed items so long runs show
+  continuous progress.
+• Automatic exponential back‑off on every Drive API call plus retries for
+  transient network / SSL / token‑refresh errors.
+• Rotation – keeps the newest KEEP dated backups in DEST_FOLDER_ID.
+• Auth – credentials.json (script dir → repo root) → KEY env‑var
+  (GitHub Secret containing the raw service‑account JSON).
+
+**The former “Resume” folder has been removed from SOURCES.**
+
+Run:
+    python weekly_backup.py
+"""
+
 from __future__ import annotations
 import json, logging, random, re, sys, time, ssl, socket
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from os import getenv
@@ -15,30 +32,35 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.auth.exceptions import RefreshError
 
-# ───────── CONFIG ─────────
-DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"
-KEEP           = 5
-DATE_FMT       = "%d.%m.%Y"
+# ─────────── SETTINGS ───────────
+DEST_FOLDER_ID = "1q9spRw8OX_V9OXghNbmZ2a2PHSb07cgF"   # backup root
+KEEP           = 5                                     # retain newest N backups
+DATE_FMT       = "%d.%m.%Y"                            # dated folder name
 SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
-RESUME_ID      = ""      # process last
-LOG_EVERY      = 100                                      # heartbeat freq
+LOG_EVERY      = 100                                   # heartbeat frequency
 
 SOURCES = [
-    # folders (except Resume, which is appended later)
-    "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb", "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
-    "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB", "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
+    # folder sources
+    "16VQxSSw_Zybv7GtFMhQgzyzyE5EEX9gb",
+    "10lXwcwYGsbdIYLhkL9862RP4Xi1L-p9v",
+    "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB",
+    "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
     "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
-    # single spreadsheets
-    "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M", "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
-    "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4", "1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s",
-    "1cE-eC__yz6bz931D3DyFj-ZyzJGIx-Ta", "1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8",
-    "1ZplJsdLtZaWnIcU4TdgI_zWZkmpuqh7kc1DDp25NtME", "10_x9pkkfmm2K3L6l35P1B1kBG0dSpZ4MQMADXMLvg9I",
-    "1aEkju3lf6MfeXIcbiq3Gu6T1KCkFnVLyRrOwS8iLvTM", "1XFo-LxfkFXg9EUipvVAys0vIJ2xjdlTsx7MwVjeyQHY",
+    # individual spreadsheets / files
+    "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M",
+    "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
+    "1x-XkSVBSprrZWMNJKAxEI2S2QfqIhU50GMuHXTGyPx4",
+    "1inqfbzosNG6Xf8AxJEJH8yoSLJy3b6_7c8cqy1yXq6s",
+    "1cE-eC__yz6bz931D3DyFj-ZyzJGIx-Ta",
+    "1HhMiTjrFYqgl33IcFS2X1gAtAW42hVCIxLMd6UVUjN8",
+    "1ZplJsdLtZaWnIcU4TdgI_zWZkmpuqh7kc1DDp25NtME",
+    "10_x9pkkfmm2K3L6l35P1B1kBG0dSpZ4MQMADXMLvg9I",
+    "1aEkju3lf6MfeXIcbiq3Gu6T1KCkFnVLyRrOwS8iLvTM",
+    "1XFo-LxfkFXg9EUipvVAys0vIJ2xjdlTsx7MwVjeyQHY",
     "1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc",
 ]
-SOURCES.append(RESUME_ID)        # ensure Resume is last
-# ──────────────────────────
+# ────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,12 +69,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ---------- Drive request flags ----------
 FOLDER_MIME = "application/vnd.google-apps.folder"
 LIST_FLAGS  = dict(supportsAllDrives=True, includeItemsFromAllDrives=True, pageSize=1000)
 WRITE_FLAGS = dict(supportsAllDrives=True)
 GET_FLAGS   = dict(supportsAllDrives=True)
 
-# ---------- API back‑off wrapper ----------
+# ---------- back‑off wrapper ----------
 TRANSIENT_EXC = (
     HttpError, RefreshError,
     ssl.SSLError, socket.timeout, ConnectionResetError,
@@ -83,13 +106,13 @@ def gapi_execute(req, *, max_tries: int = 7):
             delay *= 2
 # ------------------------------------------
 
-# canonical‑name helper
+# ---------- helpers ----------
 canon_rx = re.compile(r"^(?:(?:Copy of |Copia de )+)?(.+?)(?: \(\d+\))?(\.[^.]+)?$", re.I)
 def canonical(name: str) -> str:
+    """Return lower‑cased canonical name without 'Copy of', ' (1)' etc."""
     stem, ext = canon_rx.match(name).groups()
     return f"{stem.strip().lower()}{ext or ''}"
 
-# ---------- credentials ----------
 def load_credentials():
     here = Path(__file__).resolve().parent
     for p in (here / "credentials.json", here.parent / "credentials.json"):
@@ -98,7 +121,7 @@ def load_credentials():
     if (raw := getenv("KEY")):
         return service_account.Credentials.from_service_account_info(json.loads(raw), scopes=SCOPES)
     raise RuntimeError("Service‑account credentials not found")
-# ---------------------------------
+# --------------------------------
 
 # ---------- housekeeping ----------
 def rotate_backups(drive):
@@ -117,10 +140,11 @@ def rotate_backups(drive):
     for f in dated[KEEP:]:
         gapi_execute(drive.files().delete(fileId=f["id"], **WRITE_FLAGS))
         log.info("Deleted old backup %s", f["name"])
-# ----------------------------------
+# ---------------------------------
 
-# ---------- recursive cloning with heartbeat ----------
+# ---------- recursive clone ----------
 def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
+    """Clone an entire folder tree; return (copied, duplicates)."""
     src_name = gapi_execute(drive.files().get(
         fileId=src_id, fields="name", **GET_FLAGS))["name"]
     dst_id = gapi_execute(drive.files().create(
@@ -129,7 +153,6 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
 
     copied = dup = processed = 0
     dup_guard: set[str] = set()
-
     page = None
     while True:
         resp = gapi_execute(drive.files().list(
@@ -156,12 +179,12 @@ def clone_folder(drive, src_id: str, dst_parent: str) -> tuple[int, int]:
                     except HttpError as e:
                         log.warning("    Skip %s – %s", f["name"], e)
             if processed % LOG_EVERY == 0:
-                log.info("    …%s: %d files processed so far", src_name, processed)
+                log.info("    …%s: %d items processed", src_name, processed)
         page = resp.get("nextPageToken")
         if not page:
             break
     return copied, dup
-# ----------------------------------------
+# --------------------------------------
 
 # ---------- main ----------
 def main():
@@ -175,7 +198,7 @@ def main():
         fields="id", **WRITE_FLAGS))["id"]
     log.info("Created backup folder %s (id=%s)", today, backup_root)
 
-    for sid in dict.fromkeys(SOURCES):  # order preserved; duplicates removed
+    for sid in dict.fromkeys(SOURCES):  # de‑duplicate list
         try:
             meta = gapi_execute(drive.files().get(
                 fileId=sid, fields="id,name,mimeType", **GET_FLAGS))
@@ -189,7 +212,6 @@ def main():
             log.info("Cloning folder %s …", name)
             c, d = clone_folder(drive, sid, backup_root)
             log.info("Folder %-25s → %5d copied, %4d duplicates skipped", name, c, d)
-
         else:
             existing = gapi_execute(drive.files().list(
                 q=f"'{backup_root}' in parents and name='{name}' and trashed=false",
