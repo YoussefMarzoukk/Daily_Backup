@@ -3,8 +3,6 @@ weekly_backup.py – full‑tree Drive backup with:
 • Resume folder processed last
 • Heart‑beat progress log every LOG_EVERY files
 • Duplicate guard + exponential back‑off + transient‑error retry
-"""
-
 from __future__ import annotations
 import json, logging, random, re, sys, time, ssl, socket
 from collections import deque
@@ -23,7 +21,7 @@ KEEP           = 5
 DATE_FMT       = "%d.%m.%Y"
 SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
-RESUME_ID      = "1g6FARH-wKNk9o0s74X60cifwcc6YDqoP"      # process last
+RESUME_ID      = ""      # process last
 LOG_EVERY      = 100                                      # heartbeat freq
 
 SOURCES = [
