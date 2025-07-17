@@ -284,6 +284,7 @@ SOURCES = [
     "17O23nAlgh2fnlBcIBmk2K7JBeUAAQZfB",
     "1-sVtj8AdMB7pQAadjB9_CUmQ67gOXswi",
     "1GSWRpzm9OMNQF7Wbcgr7cLE5zX8gPEbO",
+
     # individual spreadsheets / files
     "1zvHfXlJ_U1ra6itGwjVy2O1_N-uDJn9xmEuen7Epk1M",
     "1P6A405z9-zy_QAEihk0tdsdvFGssQ26f79IJO6cgjD4",
@@ -296,6 +297,13 @@ SOURCES = [
     "1aEkju3lf6MfeXIcbiq3Gu6T1KCkFnVLyRrOwS8iLvTM",
     "1XFo-LxfkFXg9EUipvVAys0vIJ2xjdlTsx7MwVjeyQHY",
     "1JESHGsBdVLEqCiLssy7ZZ12S6V-0mZMc",
+
+    # --- new ---
+    "1lAPxxKAFkcwXHavT2a5bQiPFtD0ddUJn",      # + Work calendar sheet
+    "1vFzcPK72TDX_ZA0R6_kwJgEH3p7QNc7e5Zg4D4Cup-E",  # +
+    "1MNF5OR44GeC9opM5VN00gRP9UP88eTyQnaEjy0I2C7o",  # +
+    "1mTBJW-i5jjVDjypqD5tDM0jCuAg021oc",            # +
+    "12OnW564sXL5yeEo2w7Bvs9ThDeJIgZOw",            # +
 ]
 
 logging.basicConfig(
